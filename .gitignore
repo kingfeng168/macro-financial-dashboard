@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.eia_key
+*.zip
+.DS_Store
+*.log
+server_err.log
