@@ -255,6 +255,8 @@ def _apply_fallback(item, cache):
         item["actual"] = cached.get("actual")
         if cached.get("previous"):
             item["previous"] = cached["previous"]
+        if cached.get("forecast"):   # 2026-09-02: 外部核实条目可能含修正后预期值
+            item["forecast"] = cached["forecast"]
         if cached.get("note"):
             item["note"] = cached["note"]
         if cached.get("type"):
@@ -267,6 +269,8 @@ def _apply_fallback(item, cache):
             item["actual_source"] = "external_verified"
             if fb.get("previous"):
                 item["previous"] = fb["previous"]
+            if fb.get("forecast"):   # 2026-09-02: 传播修正后预期值(如 ISM 55.2)
+                item["forecast"] = fb["forecast"]
             item["note"] = fb.get("note", item.get("note", ""))
             item["event_type"] = fb.get("type", "numeric")
             cache[key] = fb
@@ -303,6 +307,17 @@ def fetch_calendar_actuals(data, use_cache=True):
         if actual is None or actual == "" or "待取数" in str(actual) or "讲话事件" in str(actual):
             if _apply_fallback(it, cache):
                 touched = True
+            continue
+        # 2026-09-02: actual 已存在的事件, 仍用外部人工核实条目的权威 forecast/previous
+        # 做一致性校正(原逻辑只补 actual 导致 ISM/英欧PMI 等显示旧错预期值)
+        for fb in _EXTRA_FALLBACKS:
+            if not _matches(it, fb["match"]):
+                continue
+            for k in ("forecast", "previous"):
+                if fb.get(k) and it.get(k) != fb[k]:
+                    it[k] = fb[k]
+                    touched = True
+            break
 
     if touched and use_cache:
         _save_cache(cache)

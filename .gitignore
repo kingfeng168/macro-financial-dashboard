@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.eia_key
+*.zip
+.DS_Store
+*.bat~
