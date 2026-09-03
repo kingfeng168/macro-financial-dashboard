@@ -1,6 +1,6 @@
 ---
 name: macro-financial-dashboard
-description: "宏观金融信息仪表盘（全球金融日报）App 完整版。覆盖实时数据服务器 live_server.py（端口 8800，提供 /api/quotes /api/news /api/kline /api/calendar /api/time /api/status /api/macro /api/advanced 九大端点）、进阶数据实时抓取模块 advanced_data.py（FRED + BIS SDMX 免密钥实时源）、统一报告生成器 generate_report.py（HTML 霓虹仪表盘 + Excel 双产出）、多源行情聚合 data_aggregator.py（Frankfurter/Sina/Yahoo/华尔街见闻/金十）、财经日历 actual 回填 calendar_fetcher.py，以及三时段财经日历、实时宏观卡片、TIPS 利差/原油/广义美元/EER 四个霓虹实时图。本 skill 打包了本版本全部源码与示例数据，可直接运行。触发场景：生成全球金融日报、启动/重启实时服务器、查询或新增 API 端点、修改进阶数据/霓虹图表/财经日历/宏观模块、配置每日 22:00 自动化、排查 FRED/BIS 抓取问题。关键词：全球金融日报、live_server、advanced_data、generate_report、daily_data.json、财经日历、霓虹图表、FRED、BIS、宏观实时。"
+description: "宏观金融信息仪表盘（全球金融日报）App 完整版。覆盖实时数据服务器 live_server.py（端口 8800，提供 /api/quotes /api/news /api/kline /api/calendar /api/time /api/status /api/macro /api/advanced 九大端点）、进阶数据实时抓取模块 advanced_data.py（FRED + BIS SDMX 免密钥实时源；EIA v2 REST 需免费 key；WGC 文章解析；IMF COFER SDMX 3.0 真机实时）；六大核心指标（CPI / 失业率 / COT / EIA 原油库存 / WGC 央行购金 / IMF COFER）已全部实时化、统一报告生成器 generate_report.py（HTML 霓虹仪表盘 + Excel 双产出）、多源行情聚合 data_aggregator.py（Frankfurter/Sina/Yahoo/华尔街见闻/金十）、财经日历 actual 回填 calendar_fetcher.py，以及三时段财经日历、实时宏观卡片、TIPS 利差/原油/广义美元/EER 四个霓虹实时图。本 skill 打包了本版本全部源码与示例数据，可直接运行。触发场景：生成全球金融日报、启动/重启实时服务器、查询或新增 API 端点、修改进阶数据/霓虹图表/财经日历/宏观模块、配置每日 22:00 自动化、排查 FRED/BIS 抓取问题。关键词：全球金融日报、live_server、advanced_data、generate_report、daily_data.json、财经日历、霓虹图表、FRED、BIS、宏观实时。"
 agent_created: true
 ---
 
@@ -82,15 +82,23 @@ live_server.py   ──┘  (实时数据服务器 :8800)
 4. **BIS 有效汇率** — BIS SDMX `WS_EER`，8 经济体（US/EA/JP/GB/CH/CA/AU/CN）NEER/REER 月度。
    - **关键修复**：`fetch_bis_eer` 返回 `(date,value)` 元组，但消费端曾按 `(value,date)` 解包 → `neer`/`reer` 变成日期字符串 → 渲染 `toFixed` 崩溃。现统一为 `(val,date)`。
 
-### 快照板块（无免费实时源，标 `live=False`，用 `daily_data.json` 快照）
-`fx_swap` 外汇掉期 / `cofer` IMF 美元储备份额 / `cot` CFTC 持仓 / `cb_gold` 央行购金 / `etf_gold` 黄金 ETF / `gold_demand` 黄金需求 / `eia_oil` EIA 原油库存 / `dxy_ibs` DXY-IBS / `eia_iea_oil` EIA/IEA 原油。
+### 实时板块（需 key 或真机可达）
+5. **美国 CPI / 失业率** — FRED `CPIAUCSL` / `UNRATE`（取约 2 年月度 → 13 点同比/环比趋势），`days=820` 并行抓取。
+6. **CFTC COT 持仓** — CFTC TFF 周报（8 币种杠杆基金净 + 全体净），`fetch_cot()` 解析。
+7. **EIA 原油库存** — EIA v2 REST `petroleum/stoc/wstk/data` + `facets[series][]=WCRSTUS1`（美国商业原油库存·千桶·周度），**需免费 `EIA_API_KEY`**（已环境变量化，无硬编码）。
+8. **WGC 央行购金** — 解析 `www.gold.org` Gold Demand Trends 文章叙述文本，提取最新季度净购金 / H1 合计（沙箱仅 www.gold.org 可达，api.gold.org 被拦）。
+9. **IMF COFER 外汇储备份额** — IMF SDMX 3.0 `Q.G001.AFXRA.CI_USD+CI_EUR+CI_JPY+CI_GBP+CI_CNY.SHRO_PT`（美元/欧元/人民币/日元/英镑份额%），双端点容灾（www.imf.org / api.imf.org）；**真机实时、沙箱因 Akamai WAF 403 自动回退快照**。
 
-### 前端霓虹图表（4 实时 + 9 快照）
+### 快照板块（仍无免费实时源，标 `live=False`，用 `daily_data.json` 快照）
+`fx_swap` 外汇掉期 / `etf_gold` 黄金 ETF / `gold_demand` 黄金需求 / `dxy_ibs` DXY-IBS / `eia_iea_oil` EIA/IEA 原油。
+
+### 前端霓虹图表（实时面板霓虹，快照面板素色）
 - 通用 `neonLine(cid, seriesMap, opt)`：发光描边（`shadowBlur`/`shadowColor`）、线性渐变填充、末端 `markPoint` 辉光高亮最新值、霓虹 tooltip + dataZoom、1300ms 入场动画；每次 `dispose+reinit`（规避旧实例刷新不重绘）。
 - **TIPS 利差图**：青 `#00f0ff` 实际收益率 / 品红 `#ff2d95` 盈亏平衡通胀 / 绿 `#00ff9d` **计算利差(DFII10−T10YIE)** 三条霓虹线。
 - **原油霓虹图**：琥珀 `#ffa940` WTI / 橙 `#ff6b35` Brent。
 - **广义美元指数霓虹图**：蓝 `#4dabf7`。
 - **多国 EER 对比图**：7 国 REER 霓虹多线（品红起头的霓虹调色板）。
+- **COT 净头寸走势图（v1.1.0 增强）**：「杠杆基金净 / 全体净」一键切换；零轴正负着色——**正值 = 青 `#00f0ff` · 负值 = 品红 `#ff2d95`**（用 `neonLine` 的 `posNeg` + ECharts `visualMap` 按 y 符号分段），净多 / 净空一目了然。
 - 设计取舍：**实时面板=霓虹，快照面板=素色** → "霓虹=实时"视觉信号。
 
 ---
