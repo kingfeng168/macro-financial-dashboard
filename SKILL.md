@@ -31,7 +31,7 @@ live_server.py   ──┘  (实时数据服务器 :8800)
 | 文件 | 行数 | 职责 |
 |------|------|------|
 | `live_server.py` | 1333 | 实时数据服务器（ThreadingHTTPServer）。九大 API 端点 + HTML 静态服务；服务端对 `/api/advanced`、`/api/macro` 做硬超时兜底与缓存。 |
-| `advanced_data.py` | 355 | **进阶数据实时抓取核心**。免密钥源：FRED CSV（TIPS/盈亏平衡/SOFR/WTI/Brent/广义美元）+ BIS SDMX WS_EER（8 经济体 NEER/REER）。无免费实时源的板块回退 `daily_data.json` 快照并标 `live=False`。 |
+| `advanced_data.py` | 845 | **进阶数据实时抓取核心**。FRED 双通道（官方 JSON API 优先，需可选 `FRED_API_KEY`；未配自动回退公开 CSV，仍实时）：TIPS/盈亏平衡/SOFR/WTI/Brent/广义美元/CPI/失业率；BIS SDMX WS_EER（8 经济体 NEER/REER）。无免费实时源的板块回退 `daily_data.json` 快照并标 `live=False`。 |
 | `data_aggregator.py` | ~1750 | 多源行情/新闻聚合。Frankfurter(ECB) 外汇、Sina 商品/指数、Yahoo(DXY/BTC/VIX/罗素)、华尔街见闻快讯/文章/热榜、金十快讯、Eastmoney、Tencent、FxMacro/ForexFactory 财经日历 actual 回填。 |
 | `generate_report.py` | 1554 | 统一生成器。读 `daily_data.json` → 生成霓虹 HTML 仪表盘 + Excel。含 `neonLine()` 通用霓虹渲染器、13 个 `renderAdv*` 面板、`fetchAdvanced()` 实时拉取。 |
 | `calendar_fetcher.py` | 1283 | 财经日历 actual 回填。按 `(country,event,time)` 三元组匹配，应用内置 `_FALLBACK_ACTUALS` + 外部 `calendar_actuals_extra.json`。 |
@@ -72,18 +72,20 @@ live_server.py   ──┘  (实时数据服务器 :8800)
 
 统一入口 `fetch_advanced_realtime(daily_data, force=False)`，返回 `{ok, fetched_at, source, sections:{...}}`。
 
-### 实时板块（免密钥源）
-1. **TIPS / 盈亏平衡 / SOFR** — FRED 单序列 CSV：
+### 实时板块（免密钥源；FRED 可选 key 走官方 API）
+1. **TIPS / 盈亏平衡 / SOFR** — FRED **双通道**（`_fetch_fred_one`）：
    - `DFII10` 10Y TIPS 实际收益率，`T10YIE` 10Y 盈亏平衡通胀，`SOFR` 隔夜担保融资。
-   - **关键修复**：FRED 单序列 CSV 首列叫 `observation_date`（多序列才叫 `DATE`），原解析只认 `DATE` → 所有序列静默解析为空 → 全回退快照（这正是"进阶数据不实时"的真因）。现 `_fetch_fred_one` 按列名定位日期列（`date` 或 `observation_date` 任一）。
-   - `fetch_fred_all` 改为**逐序列并行** + `cosd` 起始日过滤（多 id 拼接会忽略 `cosd` 返回全历史 6000+ 行，故必须逐序列）。
+   - **通道1（优先）官方 JSON API**：配置了 `FRED_API_KEY` 时走 `api.stlouisfed.org/fred/series/observations`，`observation_start` 精确过滤、结构化 JSON、专用数据端点更稳定。
+   - **通道2（回退）公开 CSV**：未配 key 或 API 失败时走 `fredgraph.csv`，**仍然实时**，功能不降级。
+   - `fetch_fred_all` 逐序列并行 + 起始日过滤（多 id 拼接会忽略 `cosd` 返回全历史 6000+ 行，故必须逐序列）。
+   - **历史修复**：单序列 CSV 首列叫 `observation_date`（多序列才叫 `DATE`），原解析只认 `DATE` → 全序列静默为空 → 全回退快照（"进阶数据不实时"的真因）。CSV 通道按列名定位日期列；API 通道天然无此歧义。
 2. **原油（WTI / Brent）** — FRED `DCOILWTICO` / `DCOILBRENTEU`。
 3. **广义美元指数** — FRED `DTWEXBGS`（贸易加权，DXY 权威代理）。
 4. **BIS 有效汇率** — BIS SDMX `WS_EER`，8 经济体（US/EA/JP/GB/CH/CA/AU/CN）NEER/REER 月度。
    - **关键修复**：`fetch_bis_eer` 返回 `(date,value)` 元组，但消费端曾按 `(value,date)` 解包 → `neer`/`reer` 变成日期字符串 → 渲染 `toFixed` 崩溃。现统一为 `(val,date)`。
 
 ### 实时板块（需 key 或真机可达）
-5. **美国 CPI / 失业率** — FRED `CPIAUCSL` / `UNRATE`（取约 2 年月度 → 13 点同比/环比趋势），`days=820` 并行抓取。
+5. **美国 CPI / 失业率** — FRED `CPIAUCSL` / `UNRATE`（取约 2 年月度 → 13 点同比/环比趋势），`days=820` 并行抓取。**同走 FRED 双通道，非必须 key**。
 6. **CFTC COT 持仓** — CFTC TFF 周报（8 币种杠杆基金净 + 全体净），`fetch_cot()` 解析。
 7. **EIA 原油库存** — EIA v2 REST `petroleum/stoc/wstk/data` + `facets[series][]=WCRSTUS1`（美国商业原油库存·千桶·周度），**需免费 `EIA_API_KEY`**（已环境变量化，无硬编码）。
 8. **WGC 央行购金** — 解析 `www.gold.org` Gold Demand Trends 文章叙述文本，提取最新季度净购金 / H1 合计（沙箱仅 www.gold.org 可达，api.gold.org 被拦）。
@@ -145,6 +147,7 @@ live_server.py   ──┘  (实时数据服务器 :8800)
 - **中国股市惯例**：涨=红、跌=绿（实际值高于预期也用红/绿标识）。
 - **剔除人民币数据**：外汇/债券/央行/日历均不含 CNY/PBOC/LPR（用户 2026-08-19 要求）。
 - **输出位置**：生成文件统一到 `D:\workbuddy\输出文件`（用户偏好，禁写 C 盘）；预览 `http://localhost:8800/`。可用环境变量 `WORKBUDDY_OUTPUT`（HTML/Excel）、`WORKBUDDY_DATA_DIR`（daily_data.json）覆盖。
+- **API 密钥（可选，均环境变量化，公开副本无硬编码）**：`FRED_API_KEY` 走 FRED 官方 JSON API —— **不配也能用**，自动回退公开 CSV 通道、仍保持实时；`EIA_API_KEY` 取 EIA 原油库存 —— **不配则该板块回退快照**。设置：Windows `set FRED_API_KEY=你的key`，Linux/Mac `export FRED_API_KEY=你的key`。
 - **Python 环境**：managed `python 3.13.12`；生成 Excel 必须用 venv `envs/default`（含 `xlsxwriter 3.2.9`），managed 环境缺该依赖。
 - **Excel 生成**：通过 `xlsxwriter`；若缺失则用纯标准库 `zipfile`+`xml` 兜底（见其他技能约定）。
 - **编码**：`live_server.py` 中文以 `\uXXXX` 转义存储（直接 Edit 改含中文字典会匹配失败，须脚本替换）。

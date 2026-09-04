@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """进阶数据 (Advanced Data) 实时抓取模块。
 
-为「进阶数据」面板提供免费、无需密钥的实时数据源：
-  - FRED 公开 CSV（无需 key）：
+为「进阶数据」面板提供免费的实时数据源：
+  - FRED（官方 JSON API 优先，需免费 key；未配置时自动回退公开 CSV）：
       * DFII10     10年期 TIPS 实际收益率
       * T10YIE     10年期盈亏平衡通胀（市场通胀预期）
       * SOFR       担保隔夜融资利率
@@ -16,8 +16,8 @@
   - WGC 央行购金（www.gold.org Gold Demand Trends 文章解析，无需 key）
   - IMF COFER 外汇储备币种份额（SDMX 3.0，沙箱被 WAF 拦、真机实时，无需 key）
 
-实时源（无需 key）：FRED 6序列 + BIS 有效汇率 + WGC 央行购金 + IMF COFER(真机)；
-需 key 实时源：EIA 原油库存。
+实时源（无需 key）：BIS 有效汇率 + WGC 央行购金 + IMF COFER(真机)；
+需 key 实时源：FRED 官方 API（未配 key 时自动回退公开 CSV，仍保持实时）、EIA 原油库存。
 对仍无免费实时源的数据（外汇掉期 / 黄金ETF / 黄金需求），
 从 daily_data.json 取快照并标记 live=False，由前端显示「快照·更新于 X」。
 
@@ -64,8 +64,16 @@ def _https_get_bytes(url, timeout=35):
         return r.read()
 
 
-# ---------- FRED 公开 CSV（无需 key） ----------
-# cosd 限制起始日，避免下载 6000+ 行完整历史（提速关键）
+# ---------- FRED（官方 API 优先，公开 CSV 回退） ----------
+# 公开分发版：FRED key 仅通过环境变量 FRED_API_KEY 提供，不在代码中硬编码。
+#   不配 key 也能实时（自动回退公开 CSV 通道）；配了则走更稳定的官方 JSON API。
+#   设置： Windows: set FRED_API_KEY=你的key   Linux/Mac: export FRED_API_KEY=你的key
+FRED_API_KEY = os.environ.get("FRED_API_KEY") or ""
+# 官方 JSON API：observation_start 精确过滤，结构化返回（无 CSV 表头歧义），端点更稳定
+FRED_API = ("https://api.stlouisfed.org/fred/series/observations"
+            "?series_id={id}&api_key={key}&file_type=json"
+            "&observation_start={cosd}&sort_order=asc")
+# 回退通道：公开 CSV（无需 key）。cosd 限制起始日，避免下载 6000+ 行完整历史（提速关键）
 FRED_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}&cosd={cosd}"
 
 # 序列 -> 中文名 / 用途
@@ -82,21 +90,44 @@ FRED_SERIES = {
 # WCRSTUS1 = 美国商业原油库存（不含 SPR），千桶，周度；市场最关注的 EIA 库存口径。
 # 公开分发版：EIA key 仅通过环境变量 EIA_API_KEY 提供，不在代码中硬编码。
 #   运行前设置： Windows: set EIA_API_KEY=你的key   Linux/Mac: export EIA_API_KEY=你的key
-# 未设置时回退空值 -> EIA 面板自动显示快照（不报错）。
 EIA_API_KEY = os.environ.get("EIA_API_KEY") or ""
 EIA_CRUDE_URL = "https://api.eia.gov/v2/petroleum/stoc/wstk/data"
 EIA_CRUDE_SERIES = "WCRSTUS1"
 
 
 def _fetch_fred_one(sid, days=120, timeout=12):
-    """抓取单个 FRED 序列（带 cosd 起始日过滤），返回 [[date, value|None], ...]。
+    """抓取单个 FRED 序列（带起始日过滤），返回 [[date, value|None], ...]。
 
-    注意：FRED 的 fredgraph.csv 在多 id 拼接时会**忽略 cosd**（返回全历史），
-    因此改为逐序列请求 + cosd，由上层并行调度——既保留 120 天窗口，又缩小单次下载量。
+    双通道，任一成功即返回：
+      1) 官方 JSON API（需 FRED_API_KEY）——observation_start 精确过滤、结构化返回，
+         无 CSV 表头歧义，且是专用数据端点，比图表端点更稳定；
+      2) 公开 CSV fredgraph.csv（无需 key）——未配 key 或 API 失败时回退。
+
+    两条通道均逐序列请求（fredgraph.csv 多 id 拼接会忽略 cosd 返回全历史，
+    故必须逐序列），由上层并行调度；单序列失败不影响其他序列。
     """
+    cosd = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    # ---- 通道1：官方 JSON API ----
+    if FRED_API_KEY:
+        try:
+            url = FRED_API.format(id=sid, key=FRED_API_KEY, cosd=cosd)
+            d = json.loads(_https_get(url, timeout=timeout))
+            out = []
+            for o in d.get("observations", []):
+                v = (o.get("value") or ".").strip()
+                try:
+                    out.append([o.get("date"), None if v in (".", "") else float(v)])
+                except (TypeError, ValueError):
+                    out.append([o.get("date"), None])
+            if out:
+                return out
+        except Exception:
+            pass  # 落到 CSV 回退通道
+
+    # ---- 通道2：公开 CSV 回退 ----
     out = []
     try:
-        cosd = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
         url = FRED_CSV.format(id=sid, cosd=cosd)
         raw = _https_get(url, timeout=timeout)
         lines = [ln for ln in raw.split("\n") if ln.strip()]
