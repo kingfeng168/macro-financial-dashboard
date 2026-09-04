@@ -20,6 +20,7 @@
 import json
 import os
 import ssl
+import threading
 import urllib.request
 import urllib.error
 
@@ -181,6 +182,31 @@ class Jin10MCP:
             cursor = data["next_cursor"]
 
 
+# ---------------- 客户端实例复用 ----------------
+# 握手（initialize + notifications/initialized）每进程只需一次。
+# live_server 常驻且自动更新每 5 分钟触发一次，若每次新建实例会多一次无谓往返；
+# 注意限流只针对 tools/call，握手不计入，但省下的往返能明显降低刷新延迟。
+_CLIENT = None
+_CLIENT_LOCK = threading.Lock()
+
+
+def _get_client(timeout=DEFAULT_TIMEOUT):
+    """获取（必要时创建）共享客户端实例，线程安全。"""
+    global _CLIENT
+    if _CLIENT is None:
+        with _CLIENT_LOCK:
+            if _CLIENT is None:
+                _CLIENT = Jin10MCP(timeout=timeout)
+    return _CLIENT
+
+
+def _reset_client():
+    """调用失败时丢弃实例，下次重新握手（避免复用处于坏状态的连接）。"""
+    global _CLIENT
+    with _CLIENT_LOCK:
+        _CLIENT = None
+
+
 # ---------------- 模块级便利函数 ----------------
 def fetch_flash_raw(limit=20, max_pages=3, timeout=DEFAULT_TIMEOUT):
     """取金十快讯原始 item 列表（最多 max_pages 页后截断到 limit 条）。
@@ -188,7 +214,7 @@ def fetch_flash_raw(limit=20, max_pages=3, timeout=DEFAULT_TIMEOUT):
     返回 ([raw_item, ...], err)。raw_item 形如 {content, time, url}。
     """
     try:
-        cli = Jin10MCP(timeout=timeout)
+        cli = _get_client(timeout)
         out = []
         for it in cli.iter_paged("list_flash", max_pages=max_pages):
             out.append(it)
@@ -196,25 +222,27 @@ def fetch_flash_raw(limit=20, max_pages=3, timeout=DEFAULT_TIMEOUT):
                 break
         return out, None
     except Exception as e:
+        _reset_client()
         return [], str(e)
 
 
 def fetch_calendar_raw(timeout=DEFAULT_TIMEOUT):
     """取金十财经日历（当前自然周）。返回 (list, err)。"""
     try:
-        cli = Jin10MCP(timeout=timeout)
-        data = cli.call_tool("list_calendar", {}).get("data", [])
+        data = _get_client(timeout).call_tool("list_calendar", {}).get("data", [])
         return (data if isinstance(data, list) else []), None
     except Exception as e:
+        _reset_client()
         return [], str(e)
 
 
 def fetch_quote_raw(code, timeout=DEFAULT_TIMEOUT):
     """取单个品种实时行情。返回 (dict, err)。"""
     try:
-        cli = Jin10MCP(timeout=timeout)
-        return cli.call_tool("get_quote", {"code": code}).get("data", {}) or {}, None
+        d = _get_client(timeout).call_tool("get_quote", {"code": code}).get("data", {})
+        return (d or {}), None
     except Exception as e:
+        _reset_client()
         return {}, str(e)
 
 
