@@ -32,10 +32,10 @@ live_server.py   ──┘  (实时数据服务器 :8800)
 |------|------|------|
 | `live_server.py` | 1403 | 实时数据服务器（ThreadingHTTPServer）。十大 API 端点 + HTML 静态服务；服务端对 `/api/advanced`、`/api/macro` 做硬超时兜底与缓存；启动时拉起 iTick 后台轮询。 |
 | `advanced_data.py` | 845 | **进阶数据实时抓取核心**。FRED 双通道（官方 JSON API 优先，需可选 `FRED_API_KEY`；未配自动回退公开 CSV，仍实时）：TIPS/盈亏平衡/SOFR/WTI/Brent/广义美元/CPI/失业率；BIS SDMX WS_EER（8 经济体 NEER/REER）。无免费实时源的板块回退 `daily_data.json` 快照并标 `live=False`。 |
-| `data_aggregator.py` | 1966 | 多源行情/新闻聚合。Frankfurter(ECB) 外汇、Sina 商品/指数、Yahoo(DXY/BTC/VIX/罗素)、华尔街见闻快讯/文章/热榜、**金十快讯双通道（官方 MCP 优先，回退 flash_newest.js）**、Eastmoney、Tencent、FxMacro/ForexFactory 财经日历 actual 回填、**iTick 三重作用（口径优先 / 缺口补位 / 交叉校验）**。 |
-| `itick_data.py` | 605 | **iTick 行情源**（2026-09-04 新增）。后台常驻轮询 + 内存快照架构，绕开免费套餐 5 次/分钟限流。滑动窗口令牌桶限流（含 `ITICK_RESERVE` 额度预留）、按权重轮转刷新（贵金属/能源权重 2）、429 自动退避、快照落盘、kline 按需兜底（2h/4h 用 1h 聚合）。见 §6.1。 |
+| `data_aggregator.py` | 1999 | 多源行情/新闻聚合。Frankfurter(ECB) 外汇、Sina 商品/指数、Yahoo(DXY/BTC/VIX/罗素)、华尔街见闻快讯/文章/热榜、**金十快讯双通道（官方 MCP 优先，回退 flash_newest.js）**、Eastmoney、Tencent、FxMacro/ForexFactory 财经日历 actual 回填、**iTick 三重作用（口径优先 / 缺口补位 / 交叉校验）**。 |
+| `itick_data.py` | 726 | **iTick 行情源**（2026-09-04 新增）。后台常驻轮询 + 内存快照架构，绕开免费套餐 5 次/分钟限流。滑动窗口令牌桶限流（含 `ITICK_RESERVE` 额度预留）、按权重轮转刷新（贵金属/能源权重 2）、429 自动退避、快照落盘、kline 按需兜底（2h/4h 用 1h 聚合）、`CROSS_CALIBER` 跨口径登记、`fetch_series_bundle()` 一次调用产出月度+日线+收盘（用于报表口径校正）。见 §6.1。 |
 | `jin10_mcp.py` | 261 | **金十数据 MCP 客户端**（2026-09-04 新增）。标准 MCP Streamable HTTP + Bearer：`initialize` → `notifications/initialized` → `tools/list` / `resources/list` → `tools/call`；协议 `2025-11-25`；SSE 响应解析；优先读 `structuredContent`；按 `cursor` / `next_cursor` / `has_more` 分页。需可选 `JIN10_MCP_TOKEN`。 |
-| `generate_report.py` | 1666 | 统一生成器。读 `daily_data.json` → 生成霓虹 HTML 仪表盘 + Excel。含 `neonLine()` 通用霓虹渲染器、13 个 `renderAdv*` 面板、`fetchAdvanced()` 实时拉取、`_itickBadge()` 来源徽章。 |
+| `generate_report.py` | 1766 | 统一生成器。读 `daily_data.json` → 生成霓虹 HTML 仪表盘 + Excel。含 `neonLine()` 通用霓虹渲染器、13 个 `renderAdv*` 面板、`fetchAdvanced()` 实时拉取、`_itickBadge()` 五态来源徽章、`_apply_spot_caliber()` 构建期口径校正（历史曲线与实时报价同口径）。 |
 | `calendar_fetcher.py` | 1283 | 财经日历 actual 回填。按 `(country,event,time)` 三元组匹配，应用内置 `_FALLBACK_ACTUALS` + 外部 `calendar_actuals_extra.json`。 |
 | `sample_daily_data.json` | — | 示例数据入口（当前 2026-09-01 版）。重命名为 `daily_data.json` 即可让 App 离线跑起来。 |
 | `启动全球金融日报APP.bat` / `停止全球金融日报APP.bat` / `open_browser_delayed.bat` | — | Windows 一键启动/停止（pythonw 静默后台，端口 8800，延迟 5s 开浏览器）。 |
@@ -251,9 +251,48 @@ iTick **免费套餐实测硬性限流 5 次/分钟**（第 6 次起返回 `429 
 iTick 暂不可用时不更新，也不混入期货价。非 PREFER 品种行为不变。
 
 #### 前端展示（`generate_report.py`）
-- `_itickBadge(q)` 三态徽章：`itick-pref`（青色霓虹「iTick现货」，hover 显示被覆盖的期货价与分歧）、
-  `itick-warn`（琥珀色，分歧 ≥0.5% 时高亮）、`itick-ok`（灰色，正常参考价）。
-- 数据源状态栏新增 `● iTick 10/23`，hover 显示限流/成功/失败/缓存龄。
+- `_itickBadge(q)` 五态徽章，优先级自上而下：
+  1. `itick-warn` 「⚠ 期货口径」——现货源完全无数据（`showingFutures`），当前显示的是期货价；
+  2. `itick-pref` / `itick-warn`（青→琥珀）「iTick现货 [·陈旧 N分钟前]」——PREFER 品种；
+  3. `itick-ok` 「iTick补位」——主源全挂由 iTick 补位；
+  4. `itick-caliber`（灰蓝）「参考现货 价 (±x%)」——**跨口径对照**，见下；
+  5. `itick-ok` / `itick-warn` 「iTick 价 (±x%)」——同口径对照，分歧 ≥0.3% 才告警。
+- 数据源状态栏 `● iTick N/23`，hover 显示限流/成功/失败/缓存龄。
+
+#### 跨口径对照不是异常（`CROSS_CALIBER`）—— 重要
+**踩过的坑**：初版把"iTick 价 vs 主源价分歧 ≥0.5%"一律标琥珀告警。但黄金/白银/WTI/布伦特/
+天然气在 iTick 是**现货**、主源（新浪 `hf_*`）是**期货**，分歧是持有成本/升水造成的**正常价差**
+（实测 +0.2%~+2.4%，且随合约到期远近浮动）。结果这 5 个品种常年挂琥珀，告警噪声化，
+真异常反而被忽略。
+
+处理：`itick_data.CROSS_CALIBER` 显式登记跨口径品种，前端对它们只做「参考现货」灰蓝展示、
+**绝不告警**；同口径（汇率，两边都是真现货，实测分歧仅 0.08%）才用告警阈值，且收紧到 **0.3%**。
+
+> 判据：两个源若都是同一标的（如 ECB 与 iTick 的 EURUSD 都是真现货），分歧就该很小，
+> 超标即异常；若本身是不同标的（现货 vs 期货），分歧天然存在，标异常是自欺欺人。
+
+#### 历史曲线也要同口径（`_apply_spot_caliber`，v1.3.2）
+**踩过的坑**：只改了实时报价的口径，没改历史曲线。结果页面大宗商品主图末点是期货 4510.1，
+实时报价是现货 4468.7，**同一张图上凭空出现约 0.9% 的虚跌**——用户一眼看去会以为金价在跌。
+
+要点：
+- 页面大宗商品主图用的是 **`hist_commodities`（年初至今·日线，174 点）**，不是
+  `chart_commodities`（月度 9 点，仅在 `hist_*` 缺失时回退）。**只改月度序列等于没改**。
+- `generate_report.py` 构建期调用 `itick_data.fetch_series_bundle(name, year, n, asof=DATE, dates=...)`
+  **一次调用**同时产出 月度序列 + 日线对齐序列 + 最新收盘/涨跌，重算
+  `chart_commodities` / `hist_commodities` / `commodity_data`（表格静态值与 Excel 导出）。
+- `asof=DATE`：截断到报告自带截止日，避免手动重跑旧 JSON 时把今天的盘中价塞进
+  标注为上一日收盘的报告里。
+- **全有或全无**：任一月/日缺数据就整条保留期货序列，并在面板顶部打印口径说明。
+  绝不在同一条曲线里混两个标的——那比整条用期货更具误导性。
+- 实测：黄金主图末点 4472.97 vs 实时现货 4468.87 → 差 0.09%（正常日内波动）；
+  修复前是 4510.1 vs 4468.87 → 差 0.92% 且跨口径。
+
+#### 口径优先于新鲜度（语义变更）
+初版 `PREFER_MAX_STALE` 超时后会**回落主源**，但主源是期货——回落拿不到"更新鲜的现货价"，
+只会让贵金属在现货/期货之间 1% 横跳。现改为：**只要有现货快照就一直用现货**，
+超时仅置 `stale=True`（前端显示「iTick现货·陈旧 N分钟前」）；只有现货源**完全无数据**时才用期货，
+且必须打 `showingFutures=True` 让前端显示「⚠ 期货口径」。
 
 ---
 

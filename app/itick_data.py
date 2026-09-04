@@ -136,6 +136,27 @@ PREFER = {
 # 因此对现货交易者而言，宁可要稍旧的现货价，也不要实时的期货价。定 600s 留足余量。
 PREFER_MAX_STALE = 600
 
+# 与 iTick **不同口径**的品种：这些名字在 iTick 是现货，而日报主源（新浪 hf_*）是期货。
+# 实测分歧（期货相对现货）：黄金 +0.9%、白银 +0.2%、WTI +0.6%、布伦特 +2.2%、天然气 +1.8%。
+# 这是持有成本/升水造成的**正常价差**，不是数据错误，因此前端对这类品种
+# 只能做「参考展示」，绝不能当异常告警刷琥珀色——否则告警会长期噪声化，真异常反而被忽略。
+CROSS_CALIBER = {
+    "\u73b0\u8d27\u9ec4\u91d1",        # XAUUSD 现货 vs COMEX GC 期货
+    "\u73b0\u8d27\u767d\u94f6",        # XAGUSD 现货 vs COMEX SI 期货
+    "WTI\u539f\u6cb9",                 # USOIL 现货 vs CL 期货
+    "\u5e03\u4f26\u7279\u539f\u6cb9",  # UKOIL 现货 vs BZ 期货
+    "\u5929\u7136\u6c14",              # XNGUSD 现货 vs NG 期货
+}
+# 同口径（两边都是现货）的品种，分歧超过该阈值才算真异常，前端标琥珀告警。
+# 汇率两个源都是真现货（ECB 与 iTick），实测分歧仅 0.077%，所以 0.3% 足够敏感。
+DIVERGENCE_ALERT_PCT = 0.3
+
+
+def is_cross_caliber(name):
+    """该品种的 iTick 价与日报主源价是否为不同口径（现货 vs 期货）。"""
+    return name in CROSS_CALIBER
+
+
 # ------------------------------------------------------------
 # 运行状态
 # ------------------------------------------------------------
@@ -391,15 +412,16 @@ def fetch_quote(name, block=True, reserve=0):
     return q
 
 
-def _fetch_kline_raw(code, ktype, limit):
+def _fetch_kline_raw(code, ktype, limit, timeout=15, reserve=0):
     """拉一次原始 K 线并归一化。返回 [{t,o,h,l,c,v}] 升序，或 None。
 
     走 reserve=0（可动用全部额度）且允许短暂等待：K 线结果有 60s 缓存，
     偶发等待十几秒可接受；拿不到再回落到原有链路。
+    报表构建期（批量、一天一次）可把 timeout 放大到 40s，避免额度临时打满就放弃。
     """
     ok, d, err = _request(
         "/forex/kline?region=%s&code=%s&kType=%d&limit=%d" % (REGION, code, ktype, limit),
-        block=True, timeout=15, reserve=0)
+        block=True, timeout=timeout, reserve=reserve)
     if not ok or not isinstance(d, list):
         return None
     out = []
@@ -460,6 +482,105 @@ def fetch_kline(name, tf="1d", limit=100):
         return _aggregate(raw, factor)
 
     return _fetch_kline_raw(code, ktype, limit)
+
+
+def _align_daily(bars, dates, asof=None):
+    """把日线按日期轴对齐：精确取当日收盘，缺失向前填充，开头用首个已知值回填。
+
+    缺失比例超过 5% 返回 None —— 宁可整条退回期货序列，也不要半现货半期货。
+    """
+    if not bars or not dates:
+        return None
+    by_day = {}
+    for b in bars:
+        ts = datetime.fromtimestamp(b["t"] / 1000.0 if b["t"] > 1e11 else b["t"])
+        by_day["%04d-%02d-%02d" % (ts.year, ts.month, ts.day)] = float(b["c"])
+    if asof:
+        by_day = {k: v for k, v in by_day.items() if k <= asof}
+    if not by_day:
+        return None
+    out, last, missing = [], None, 0
+    for d in dates:
+        v = by_day.get(d)
+        if v is None:
+            missing += 1
+            v = last
+        else:
+            last = v
+        out.append(v)
+    if missing > max(1, int(len(dates) * 0.05)):
+        return None
+    first_known = next((x for x in out if x is not None), None)
+    if first_known is None:
+        return None
+    return [round((x if x is not None else first_known), 4) for x in out]
+
+
+def fetch_series_bundle(name, year, n_months, limit=300, timeout=45, asof=None, dates=None):
+    """一次调用同时给出「YTD 月度收盘序列」和「最新日线收盘」，均为现货口径。
+
+    为什么需要它
+    ------------
+    日报里的「现货黄金/现货白银」实时价已切成 iTick 现货（XAUUSD/XAGUSD），
+    但 daily_data.json 中的 chart_commodities 月度序列、commodity_data 静态快照
+    都是**新浪 COMEX 期货**（hf_GC/hf_SI）口径。两者不是同一标的，实测期货比现货
+    高 0.13% ~ +1.30%，且随合约到期远近浮动（正常持有成本/升水），无法用固定系数
+    折算。不处理就会出现：月度曲线末点（期货 4510.1）与实时报价（现货 4468.7）
+    错开约 1%，图上凭空多出一段虚跌；Excel 导出里"现货黄金"下面写的也是期货价。
+
+    本函数用现货日线重算整条曲线 + 最新收盘，保证「历史 — 当前 — 导出」同口径。
+
+    全有或全无
+    ----------
+    任一个月缺数据就返回 None，由调用方整条保留期货序列。**绝不在同一条曲线里
+    混两个标的**——那比整条用期货更具误导性。
+
+    参数 asof: "YYYY-MM-DD"，截断到该日为止（含）。日报自带截止日，
+    手动重跑历史 JSON 时不应把"今天"的盘中价塞进标注为上一日收盘的报告里。
+    参数 dates: 若传入日期轴，则一并给出按该轴对齐的 daily 序列（不额外消耗调用）。
+      —— hist_commodities 那条"年初至今·日线"才是页面大宗商品主图真正渲染的数据，
+         只改月度序列不改它，主图末点仍是期货价。
+
+    返回 dict 或 None：
+      {"code", "months": [float, ...](索引0=1月), "last", "prev",
+       "last_date": "YYYY-MM-DD", "chg_pct", "daily": [float,...] 或 None}
+    """
+    mapping = SYMBOLS.get(name)
+    if not mapping:
+        return None
+    code = mapping[0]
+    bars = _fetch_kline_raw(code, 8, limit, timeout=timeout)   # 8 = 日线
+    if not bars or len(bars) < 2:
+        return None
+    if asof:
+        bars = [b for b in bars
+                if datetime.fromtimestamp(
+                    b["t"] / 1000.0 if b["t"] > 1e11 else b["t"]).strftime("%Y-%m-%d") <= asof]
+        if len(bars) < 2:
+            return None
+    last = {}
+    for b in bars:
+        ts = datetime.fromtimestamp(b["t"] / 1000.0 if b["t"] > 1e11 else b["t"])
+        if ts.year != year:
+            continue
+        last[ts.month] = float(b["c"])
+    months = []
+    for m in range(1, n_months + 1):
+        if m not in last:
+            return None
+        months.append(last[m])
+    last_bar, prev_bar = bars[-1], bars[-2]
+    ld = datetime.fromtimestamp(
+        last_bar["t"] / 1000.0 if last_bar["t"] > 1e11 else last_bar["t"])
+    return {
+        "code": code,
+        "months": months,
+        "last": float(last_bar["c"]),
+        "prev": float(prev_bar["c"]),
+        "last_date": "%04d-%02d-%02d" % (ld.year, ld.month, ld.day),
+        "chg_pct": round((last_bar["c"] / prev_bar["c"] - 1) * 100, 2) if prev_bar["c"] else 0.0,
+        "daily": _align_daily(bars, dates, asof=asof) if dates else None,
+    }
 
 
 # ------------------------------------------------------------

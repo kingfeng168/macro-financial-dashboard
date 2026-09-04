@@ -106,9 +106,14 @@
 | `filled` | `true` = 主源全挂，由 iTick 补位 |
 | `altPrice` / `altSource` | 仅 `preferred=true` 时存在：被覆盖的主源价及其来源（保留可比对） |
 | `staleSec` | 快照年龄（秒） |
+| `stale` | 仅 `preferred=true`：`staleSec > PREFER_MAX_STALE(600)`。**口径优先于新鲜度**——过期仍继续用现货，不回落期货 |
+| `crossCaliber` | `true` = iTick 是现货、主源是期货（黄金/白银/WTI/布伦特/天然气），分歧属正常升水，前端按「参考」展示不告警 |
+| `showingFutures` | `true` = `PREFER` 品种但现货源完全无数据，当前显示的其实是**期货价**（前端标「⚠ 期货口径」） |
 
-> `preferred` 仅对 `PREFER` 集合（现货黄金/现货白银）生效，且要求 `staleSec <= PREFER_MAX_STALE(600)`；
-> 快照过期自动回落主源，不会因 iTick 限流导致行情中断。
+> `preferred` 仅对 `PREFER` 集合（现货黄金/现货白银）生效。**语义变更（v1.3.2）**：
+> 旧行为是快照过期即回落主源，但主源是期货，回落只会造成 1% 横跳；
+> 现改为只要有现货快照就一直用现货，过期仅置 `stale=true`；只有现货源完全无数据时
+> 才用期货，并置 `showingFutures=true` 让前端显式提示。
 
 ## 前端约定（generate_report.py）
 - `seriesMap` 标准格式：`{name:[[date, val], ...]}`（进阶/行情图通用）。

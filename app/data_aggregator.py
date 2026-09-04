@@ -534,6 +534,16 @@ def _itick_module():
         return None
 
 
+def _itick_cross_caliber(mod, name):
+    """该品种是否「iTick 现货 vs 主源期货」的跨口径对照。"""
+    if not mod:
+        return False
+    try:
+        return bool(mod.is_cross_caliber(name))
+    except Exception:
+        return False
+
+
 def fetch_itick_quotes():
     """读取 iTick 后台轮询快照。
 
@@ -695,6 +705,9 @@ def fetch_all_quotes(force=False):
             "staleSec": q_it.get("staleSec"),
             "preferred": False,
             "filled": False,
+            # iTick 是现货、主源是期货（黄金/白银/原油/天然气）时为 True。
+            # 此时分歧是正常的持有成本/升水，前端按「参考」展示而非异常告警。
+            "crossCaliber": bool(_itick_cross_caliber(mod, name)),
         }
 
         if cur is None:
@@ -706,11 +719,18 @@ def fetch_all_quotes(force=False):
             itick_filled += 1
             continue
 
-        if name in prefer and (q_it.get("staleSec") or 1e9) <= prefer_max_stale:
-            # ② 口径优先：以 iTick 现货价为准（与 MT4 实盘 XAUUSD/XAGUSD 一致）
-            #    快照过期则自动回落主源，保证行情不中断。
+        if name in prefer:
+            # ② 口径优先：以 iTick 现货价为准（与 MT4 实盘 XAUUSD/XAGUSD 一致）。
+            #
+            #    关键取舍：**口径一致性优先于数据新鲜度**。
+            #    现货与期货是两个标的，退回期货拿不到"更新的现货价"，只会拿到
+            #    另一个标的的价，表现为 1% 上下横跳（实测黄金期货比现货高约 1%）。
+            #    因此只要有现货快照就一直用现货，只是把陈旧度如实标出来；
+            #    只有在现货源完全没有数据时才退回期货，并且必须打出"期货口径"标记。
+            stale = q_it.get("staleSec")
             override = dict(q_it)
             meta["preferred"] = True
+            meta["stale"] = bool(stale is not None and stale > prefer_max_stale)
             meta["altPrice"] = cur.get("price")          # 被覆盖的期货价，保留可比对
             meta["altSource"] = cur.get("source")
             override["itick"] = meta
@@ -721,6 +741,18 @@ def fetch_all_quotes(force=False):
         # ③ 交叉校验：把 iTick 价与分歧度挂到主报价上，供前端展示
         cur["itick"] = meta
         itick_verified += 1
+
+    # 现货源完全没数据的口径品种：当前显示的是期货价，必须显式标出来，
+    # 否则「现货黄金」下面躺着期货价，跟实盘对不上还看不出原因。
+    for name in prefer:
+        cur = result.get(name)
+        if cur is not None and not cur.get("itick"):
+            cur["itick"] = {
+                "price": None, "code": None, "divPct": None,
+                "fetched_at": None, "staleSec": None,
+                "preferred": False, "filled": False,
+                "missing": True, "showingFutures": True,
+            }
 
     sources_status["itick"] = bool(itick_quotes)
 
@@ -735,6 +767,7 @@ def fetch_all_quotes(force=False):
             "filled": itick_filled,
             "verified": itick_verified,
             "preferred": itick_preferred,
+            "prefer": sorted(prefer),
         },
     }
 

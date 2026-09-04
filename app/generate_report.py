@@ -17,6 +17,87 @@ D = calendar_fetcher.fetch_calendar_actuals(D)
 
 DATE = D["date"]
 MONTHS = D["months"]
+
+
+# ------------------------------------------------------------
+# 口径校正：贵金属的"年初至今"月度序列必须与实时报价同为现货口径
+# ------------------------------------------------------------
+# 背景：日报「现货黄金/现货白银」的实时价取自 iTick 现货（XAUUSD/XAGUSD），
+# 但 daily_data.json 里的 chart_commodities 月度序列是新浪 COMEX 期货（hf_GC/hf_SI）。
+# 两者不是同一标的，实测期货比现货高 0.13%~1.30%，且随合约到期远近浮动，
+# 属正常持有成本/升水，无法用固定系数折算。若不处理，月度曲线最后一点（期货）
+# 会与实时报价（现货）错开约 1%，图上凭空多出一段虚跌。
+#
+# 处理：用 iTick 现货日线重算整条月度曲线；拉取失败则整条保留期货序列，
+# 并在图表标题上标注口径，绝不半现货半期货。
+def _apply_spot_caliber(D):
+    notes = []
+    try:
+        import itick_data
+    except Exception as e:
+        D["caliber_note"] = f"口径校正未加载 iTick：{e}（贵金属月度序列为期货口径）"
+        return D
+    if not getattr(itick_data, "ITICK_TOKEN", ""):
+        D["caliber_note"] = "口径校正未启用（ITICK_TOKEN 缺失），贵金属月度序列为期货口径"
+        return D
+
+    year = int(str(DATE)[:4])
+    charts = D.get("chart_commodities") or {}
+    rows = D.get("commodity_data") or []
+    for name in sorted(getattr(itick_data, "PREFER", ()) or ()):
+        fut_series = charts.get(name)
+        if not isinstance(fut_series, list) or not fut_series:
+            continue
+        hist = D.get("hist_commodities") or {}
+        hist_dates = (hist.get("dates") or [])[:]
+        try:
+            bun = itick_data.fetch_series_bundle(name, year, len(fut_series),
+                                                 asof=DATE, dates=hist_dates)
+        except Exception as e:
+            bun = None
+            notes.append(f"{name} 拉取现货日线异常：{e}")
+        if not bun:
+            # 拿不到现货序列：整条保留期货，并在表格备注里点明口径
+            for row in rows:
+                if isinstance(row, list) and row and row[0] == name and len(row) >= 6:
+                    row[5] = str(row[5]) + f"（期货口径 {name} 合约）"
+            notes.append(f"{name} 月度序列保持期货口径（现货日线不可用）")
+            continue
+        charts[name] = [round(v, 4) for v in bun["months"]]
+        # 主图（hist_*，年初至今·日线）才是页面大宗商品真正渲染的曲线，必须一起换口径
+        hist_series = hist.get("series") or {}
+        hist_ok = False
+        if hist_dates and name in hist_series and bun.get("daily"):
+            hist_series[name] = bun["daily"]
+            hist["series"] = hist_series
+            D["hist_commodities"] = hist
+            hist_ok = True
+        elif hist_dates and name in hist_series:
+            notes.append(f"{name} 日线主图保持期货口径（现货日线覆盖不足）")
+        # 同步静态表格与 Excel 快照，避免"图上现货、表里期货"
+        for row in rows:
+            if isinstance(row, list) and row and row[0] == name:
+                row[2] = round(bun["last"], 4)
+                row[3] = bun["chg_pct"]
+                if len(row) >= 6:
+                    row[5] = (f"现货 {bun['code']} 收盘{bun['chg_pct']:+.2f}%"
+                              f"（{bun['last_date']}）")
+        notes.append(f"{name} 月度/日线序列+收盘价已按现货口径重算（{bun['code']}，"
+                     f"{bun['last_date']} 收 {bun['last']:.2f}）" +
+                     ("" if hist_ok else "，日线主图未替换"))
+    D["chart_commodities"] = charts
+    D["commodity_data"] = rows
+    D["caliber_note"] = "；".join(notes)
+    return D
+
+
+try:
+    D = _apply_spot_caliber(D)
+    if D.get("caliber_note"):
+        print("[口径] " + D["caliber_note"])
+except Exception as e:
+    D["caliber_note"] = f"口径校正跳过：{e}"
+    print("[口径] 跳过：" + str(e))
 CUTOFF = D.get("cutoff_time", f"{DATE} 收盘")
 C = ["#58a6ff","#ff7b72","#7ee787","#ffa657","#d2a8ff","#79c0ff","#f0883e","#a5d6ff","#ff9ec7","#b3f0ff","#ffd700","#ff6b6b","#4ecdc4","#95e1d3","#c084fc","#fb7185","#f9c74f","#90be6d","#f3722c","#43aa8b","#577590","#e76f51","#8ecae6","#ffb703"]
 # Output to D:\workbuddy\输出文件 per user preference (avoid C: drive for deliverables)
@@ -155,6 +236,7 @@ tr.clickable-row{cursor:pointer;transition:background .15s}tr.clickable-row:hove
 .cb-tag{font-size:10px;padding:1px 5px;border-radius:3px;margin-left:6px}
 .cb-tag-pub{background:#1a3320;color:#7ee787}.cb-tag-up{background:#332d1a;color:#e3b341}
 .co-note{font-size:12px;color:#e3b341;background:#1c2333;border:1px solid #30363d;border-left:3px solid #e3b341;border-radius:4px;padding:6px 12px;margin-bottom:14px;display:inline-block}
+.caliber-note{border-left-color:#39d0d8;color:#7ee7ea;background:#132028;display:block;line-height:1.7}
 .sr2{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}
 .sc{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px 20px;min-width:160px;flex:1}
 .sc .lb{font-size:12px;color:#8b949e;margin-bottom:4px}.sc .vl{font-size:20px;font-weight:700}.sc .cg{font-size:13px;margin-top:2px}
@@ -206,6 +288,7 @@ tr.clickable-row{cursor:pointer;transition:background .15s}tr.clickable-row:hove
 .itick-pref{background:linear-gradient(135deg,#0d3b30,#06231c);color:#00f0ff;border:1px solid rgba(0,240,255,0.35);box-shadow:0 0 7px rgba(0,240,255,0.28);text-shadow:0 0 6px rgba(0,240,255,0.5)}
 .itick-ok{background:#21262d;color:#8b949e;border:1px solid #30363d}
 .itick-warn{background:#3d2f14;color:#ffb648;border:1px solid rgba(255,182,72,0.4);box-shadow:0 0 6px rgba(255,182,72,0.22)}
+.itick-caliber{background:#182430;color:#79c0ff;border:1px solid rgba(121,192,255,0.3)}
 .source-status-bar{font-size:11px;color:#8b949e;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 .source-status-bar span{display:flex;align-items:center;gap:4px}
 .rt-macro-title{font-size:13px;color:#58a6ff;font-weight:600;margin-bottom:10px;text-shadow:0 0 8px rgba(88,166,255,0.4)}
@@ -290,6 +373,10 @@ H.append('</div>')
 H.append('<div class="panel" id="panel-commodities">')
 H.append('<div class="st">大宗商品行情</div>')
 H.append(co())
+if D.get("caliber_note"):
+    H.append(f'<div class="co-note caliber-note">&#9878; 口径: {D["caliber_note"]}'
+             f'<br><span style="color:#8b949e">注: 现货与期货不是同一标的，价差为持有成本/升水，'
+             f'随合约到期远近浮动（实测 0.1%~1.3%），不可用固定系数折算。</span></div>')
 H.append('<div class="table-wrap"><table><thead><tr><th>品种</th><th>代码</th><th>价格</th><th>涨跌幅(%)</th><th>单位</th><th>走势</th><th>分析备注</th></tr></thead><tbody>')
 for name,code,price,chg,unit,note in D["commodity_data"]:
     d = "&#9650; 涨" if chg>0 else "&#9660; 跌" if chg<0 else "&#9670; 平"
@@ -1140,6 +1227,7 @@ function fetchQuotes(){_exclusive('quotes',function(done){
     var data=payload.quotes||payload;var cnt=Object.keys(data).length;
     var metaSources=payload.sources||{};var metaHealth=payload.health||{};
     window._itickState=(payload.itick&&payload.itick.state)||null;
+    window._itickPrefer=(payload.itick&&payload.itick.prefer)||[];
     var fetchedAt=payload.fetched_at||'';
     var ms=Date.now()-t0;_lastQuotesMs=ms;_lastQuotesAt=Date.now();
     if(elDot)elDot.classList.remove('loading');
@@ -1161,12 +1249,24 @@ function fetchQuotes(){_exclusive('quotes',function(done){
     done();
   });
 });}
-function _itickBadge(q){var m=q&&q.itick;if(!m||m.price===null||m.price===undefined)return '';var code=m.code||'iTick';var dv=m.divPct;
-if(m.preferred){return '<span class="itick-tag itick-pref" title="iTick \u73b0\u8d27\u4ef7 '+code+'&#10;\u88ab\u8986\u76d6\u7684\u671f\u8d27\u4ef7: '+(m.altPrice!=null?m.altPrice.toFixed(4):'-')+' ('+(m.altSource||'')+')&#10;\u5206\u6b67: '+(dv!=null?dv+'%':'-')+'&#10;\u66f4\u65b0: '+(m.fetchedAt||'')+'">iTick\u73b0\u8d27</span>';}
-if(m.filled){return '<span class="itick-tag itick-ok" title="\u4e3b\u6e90\u7f3a\u5931\uff0c\u7531 iTick '+code+' \u8865\u4f4d&#10;\u66f4\u65b0: '+(m.fetchedAt||'')+'">iTick\u8865\u4f4d</span>';}
-var warn=(dv!=null&&Math.abs(dv)>=0.5);
-var txt='iTick '+(m.price)+((dv!=null)?(' ('+(dv>0?'+':'')+dv+'%)'):'');
-return '<span class="itick-tag '+(warn?'itick-warn':'itick-ok')+'" title="iTick \u53c2\u8003\u4ef7 '+code+'&#10;\u4e3b\u6e90\u4ef7: '+(q.price)+'&#10;iTick \u4ef7: '+m.price+'&#10;\u5206\u6b67: '+(dv!=null?dv+'%':'-')+'&#10;\u66f4\u65b0: '+(m.fetchedAt||'')+((m.staleSec!=null)?(' ('+m.staleSec+'s\u524d)'):'')+'">'+txt+'</span>';}
+function _fmtStale(s){if(s==null)return '';return s<60?(s+'\u79d2\u524d'):(Math.floor(s/60)+'\u5206\u949f\u524d');}
+function _itickBadge(q){var m=q&&q.itick;if(!m)return '';var code=m.code||'iTick';var dv=m.divPct;var at=m.fetched_at||'';
+/* \u73b0\u8d27\u6e90\u4e0d\u53ef\u7528\uff0c\u5f53\u524d\u663e\u793a\u7684\u662f\u671f\u8d27\u4ef7 \u2014\u2014 \u5fc5\u987b\u544a\u8bc9\u7528\u6237\uff0c\u5426\u5219\u300c\u73b0\u8d27\u9ec4\u91d1\u300d\u4e0b\u9762\u8eba\u7740\u671f\u8d27\u4ef7\u800c\u65e0\u4ece\u5bdf\u89c9 */
+if(m.showingFutures){return '<span class="itick-tag itick-warn" title="\u73b0\u8d27\u6e90 iTick \u6682\u65e0\u6570\u636e\uff0c\u5f53\u524d\u663e\u793a\u7684\u662f\u671f\u8d27\u4ef7\uff08'+(q.source||'')+'\uff09\u3002&#10;\u73b0\u8d27\u4e0e\u671f\u8d27\u4e0d\u662f\u540c\u4e00\u6807\u7684\uff0c\u5b9e\u6d4b\u5dee 0.1%~1.3%\uff0c\u8bf7\u52ff\u76f4\u63a5\u5f53\u4f5c\u73b0\u8d27\u4ef7\u4f7f\u7528\u3002">\u26a0 \u671f\u8d27\u53e3\u5f84</span>';}
+if(m.price===null||m.price===undefined)return '';
+/* \u53e3\u5f84\u4f18\u5148\uff1a\u53ea\u8981\u6709\u73b0\u8d27\u5feb\u7167\u5c31\u4e00\u76f4\u7528\u73b0\u8d27\uff08\u65b0\u9c9c\u5ea6\u8ba9\u4f4d\uff09\uff0c\u9648\u65e7\u5ea6\u5982\u5b9e\u6807\u51fa */
+if(m.preferred){var st=_fmtStale(m.staleSec);var cls=m.stale?'itick-tag itick-warn':'itick-tag itick-pref';
+return '<span class="'+cls+'" title="iTick \u73b0\u8d27\u4ef7 '+code+'&#10;\u88ab\u8986\u76d6\u7684\u671f\u8d27\u4ef7: '+(m.altPrice!=null?m.altPrice.toFixed(4):'-')+' ('+(m.altSource||'')+')&#10;\u5206\u6b67: '+(dv!=null?dv+'%':'-')+'&#10;\u66f4\u65b0: '+at+(st?(' ('+st+')'):'')+'&#10;\u53e3\u5f84\u4e00\u81f4\u4f18\u5148\u4e8e\u65b0\u9c9c\u5ea6\uff1a\u5373\u4fbf\u9648\u65e7\u4ecd\u7528\u73b0\u8d27\uff0c\u4e0d\u56de\u9000\u671f\u8d27\u4ef7\u3002">iTick\u73b0\u8d27'+(m.stale?('\u00b7\u9648\u65e7 '+st):'')+'</span>';}
+if(m.filled){return '<span class="itick-tag itick-ok" title="\u4e3b\u6e90\u7f3a\u5931\uff0c\u7531 iTick '+code+' \u8865\u4f4d&#10;\u66f4\u65b0: '+at+'">iTick\u8865\u4f4d</span>';}
+var dvTxt=(dv!=null)?(' ('+(dv>0?'+':'')+dv+'%)'):'';
+/* \u8de8\u53e3\u5f84\uff08\u73b0\u8d27 vs \u671f\u8d27\uff09\uff1a\u5206\u6b67\u662f\u6301\u6709\u6210\u672c/\u5347\u6c34\uff0c\u5c5e\u6b63\u5e38\u73b0\u8c61\u3002
+   \u53ea\u505a\u300c\u53c2\u8003\u300d\u5c55\u793a\uff08\u7070\u84dd\uff09\uff0c\u4e0d\u5192\u5145\u544a\u8b66\uff1a\u5426\u5219\u6d3b\u6cb9/\u5e03\u4f26\u7279\u4f1a\u957f\u5e74\u6302\u4e0a\u7425\u73c0\u8b66\u544a\uff0c
+   \u544a\u8b66\u566a\u58f0\u5316\u540e\u771f\u5f02\u5e38\u53cd\u800c\u88ab\u5ffd\u7565\u3002 */
+if(m.crossCaliber){return '<span class="itick-tag itick-caliber" title="iTick \u73b0\u8d27\u53c2\u8003\u4ef7 '+code+'&#10;\u4e3b\u6e90\u4ef7\uff08\u671f\u8d27\uff09: '+(q.price)+'&#10;iTick \u4ef7\uff08\u73b0\u8d27\uff09: '+m.price+'&#10;\u5206\u6b67: '+(dv!=null?dv+'%':'-')+'&#10;\u6ce8: \u73b0\u8d27\u4e0e\u671f\u8d27\u4e0d\u662f\u540c\u4e00\u6807\u7684\uff0c\u8be5\u5dee\u5f02\u4e3a\u6301\u6709\u6210\u672c/\u5347\u6c34\uff0c\u5c5e\u6b63\u5e38\u73b0\u8c61&#10;\u66f4\u65b0: '+at+((m.staleSec!=null)?(' ('+_fmtStale(m.staleSec)+')'):'')+'">\u53c2\u8003\u73b0\u8d27 '+m.price+dvTxt+'</span>';}
+/* \u540c\u53e3\u5f84\uff08\u4e24\u8fb9\u90fd\u662f\u73b0\u8d27\uff09\uff1a\u8d85\u9608\u503c\u624d\u662f\u771f\u5f02\u5e38 */
+var warn=(dv!=null&&Math.abs(dv)>=0.3);
+var txt='iTick '+(m.price)+dvTxt;
+return '<span class="itick-tag '+(warn?'itick-warn':'itick-ok')+'" title="iTick \u53c2\u8003\u4ef7 '+code+'&#10;\u4e3b\u6e90\u4ef7: '+(q.price)+'&#10;iTick \u4ef7: '+m.price+'&#10;\u5206\u6b67: '+(dv!=null?dv+'%':'-')+'&#10;\u66f4\u65b0: '+at+((m.staleSec!=null)?(' ('+_fmtStale(m.staleSec)+')'):'')+'">'+txt+'</span>';}
 function updateTableCells(name,q){var rows=document.querySelectorAll('#panel-overview tbody tr,#panel-forex tbody tr,#panel-commodities tbody tr,#panel-indices tbody tr,#panel-bonds tbody tr,#panel-macro tbody tr');rows.forEach(function(row){var cells=row.querySelectorAll('td');if(cells.length<4)return;var found=false;for(var i=0;i<Math.min(cells.length,3);i++){var t=cells[i].textContent.trim();if(t===name||t.indexOf(name)>=0||name.indexOf(t)>=0){found=true;break;}}if(!found)return;if(q.price!==null&&q.price!==undefined&&cells[2]){var srcTag=q.source&&q.source!=='daily_data_fallback'?'':'<span class="data-source-tag" title="来源:'+(q.source||'')+' '+(q.fetched_at||'')+'">回退</span>';cells[2].innerHTML=q.price.toFixed(4)+srcTag+_itickBadge(q);}if(q.changePct!==null&&q.changePct!==undefined&&cells[3]){var cls=q.changePct>0?'pos':q.changePct<0?'neg':'flat';var sign=q.changePct>0?'+':'';cells[3].innerHTML='<span class="'+cls+'">'+sign+q.changePct.toFixed(2)+'</span>';}});}
 function updateStatCards(data){
   var map={'道琼斯指数':'道琼斯工业平均指数','美元指数':'美元指数','现货黄金':'现货黄金','WTI原油':'WTI原油','VIX恐慌指数':'美国VIX恐慌指数','SOFR隔夜':'SOFR隔夜'};
