@@ -672,7 +672,7 @@ def fetch_all_quotes(force=False):
     # 口径优先集合：这些品种 iTick 为现货口径，覆盖主源（新浪为期货口径）
     mod = _itick_module()
     prefer = set(getattr(mod, "PREFER", ()) or ()) if mod else set()
-    prefer_max_stale = int(getattr(mod, "PREFER_MAX_STALE", 300) or 300) if mod else 300
+    prefer_max_stale = int(getattr(mod, "PREFER_MAX_STALE", 600) or 600) if mod else 600
 
     itick_preferred = 0
     for name, q_it in (itick_quotes or {}).items():

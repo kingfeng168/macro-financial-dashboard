@@ -107,7 +107,7 @@
 | `altPrice` / `altSource` | 仅 `preferred=true` 时存在：被覆盖的主源价及其来源（保留可比对） |
 | `staleSec` | 快照年龄（秒） |
 
-> `preferred` 仅对 `PREFER` 集合（现货黄金/现货白银）生效，且要求 `staleSec <= PREFER_MAX_STALE(300)`；
+> `preferred` 仅对 `PREFER` 集合（现货黄金/现货白银）生效，且要求 `staleSec <= PREFER_MAX_STALE(600)`；
 > 快照过期自动回落主源，不会因 iTick 限流导致行情中断。
 
 ## 前端约定（generate_report.py）
