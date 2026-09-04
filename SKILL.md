@@ -32,7 +32,8 @@ live_server.py   ──┘  (实时数据服务器 :8800)
 |------|------|------|
 | `live_server.py` | 1333 | 实时数据服务器（ThreadingHTTPServer）。九大 API 端点 + HTML 静态服务；服务端对 `/api/advanced`、`/api/macro` 做硬超时兜底与缓存。 |
 | `advanced_data.py` | 845 | **进阶数据实时抓取核心**。FRED 双通道（官方 JSON API 优先，需可选 `FRED_API_KEY`；未配自动回退公开 CSV，仍实时）：TIPS/盈亏平衡/SOFR/WTI/Brent/广义美元/CPI/失业率；BIS SDMX WS_EER（8 经济体 NEER/REER）。无免费实时源的板块回退 `daily_data.json` 快照并标 `live=False`。 |
-| `data_aggregator.py` | ~1750 | 多源行情/新闻聚合。Frankfurter(ECB) 外汇、Sina 商品/指数、Yahoo(DXY/BTC/VIX/罗素)、华尔街见闻快讯/文章/热榜、金十快讯、Eastmoney、Tencent、FxMacro/ForexFactory 财经日历 actual 回填。 |
+| `data_aggregator.py` | 1845 | 多源行情/新闻聚合。Frankfurter(ECB) 外汇、Sina 商品/指数、Yahoo(DXY/BTC/VIX/罗素)、华尔街见闻快讯/文章/热榜、**金十快讯双通道（官方 MCP 优先，回退 flash_newest.js）**、Eastmoney、Tencent、FxMacro/ForexFactory 财经日历 actual 回填。 |
+| `jin10_mcp.py` | 233 | **金十数据 MCP 客户端**（2026-09-04 新增）。标准 MCP Streamable HTTP + Bearer：`initialize` → `notifications/initialized` → `tools/list` / `resources/list` → `tools/call`；协议 `2025-11-25`；SSE 响应解析；优先读 `structuredContent`；按 `cursor` / `next_cursor` / `has_more` 分页。需可选 `JIN10_MCP_TOKEN`。 |
 | `generate_report.py` | 1554 | 统一生成器。读 `daily_data.json` → 生成霓虹 HTML 仪表盘 + Excel。含 `neonLine()` 通用霓虹渲染器、13 个 `renderAdv*` 面板、`fetchAdvanced()` 实时拉取。 |
 | `calendar_fetcher.py` | 1283 | 财经日历 actual 回填。按 `(country,event,time)` 三元组匹配，应用内置 `_FALLBACK_ACTUALS` + 外部 `calendar_actuals_extra.json`。 |
 | `sample_daily_data.json` | — | 示例数据入口（当前 2026-09-01 版）。重命名为 `daily_data.json` 即可让 App 离线跑起来。 |
@@ -138,7 +139,22 @@ live_server.py   ──┘  (实时数据服务器 :8800)
 4. **Yahoo Finance**：仅 DXY/BTC/VIX/罗素，常 403。
 5. 内存价格历史：30s 累积，支持 1h/4h/1d K 线聚合。
 
-新闻：华尔街见闻快讯/文章/热榜、金十快讯、Eastmoney、Sina RSS（去重 + 去广告 + 时效性排序）。
+新闻：华尔街见闻快讯/文章/热榜、**金十快讯（双通道）**、Eastmoney、Sina RSS（去重 + 去广告 + 时效性排序）。
+
+### 金十快讯双通道（`fetch_jin10_flash`）
+| 通道 | 依赖 | 数据来源 | 特点 |
+|------|------|----------|------|
+| 1（优先） | `JIN10_MCP_TOKEN` | 官方 MCP `list_flash` | 结构化字段、**真实详情页 url**（`flash.jin10.com/detail/...`）、ISO 标准时间，无需正则逆向 |
+| 2（回退） | 无 | `flash_newest.js` 抓取 | 无需密钥仍保持实时；url 为写死首页 `https://www.jin10.com/` |
+
+- MCP 通道实现要点（`jin10_mcp.py`，均已实测验证）：
+  - 服务端**不返回 `Mcp-Session-Id`** → 按**无状态模式**处理，每次请求独立带 Bearer，握手每进程一次即可
+  - 响应是 **SSE**（`Content-Type: text/event-stream`），必须从 `data:` 行提取 JSON；直接 `json.loads(body)` 会解析失败
+  - 结果优先读 `result.structuredContent`；`result.content` 仅作可读补充，**不作为机器解析来源**
+  - 分页：请求 `cursor` / 响应 `data.next_cursor` / `data.has_more`；`list_flash` 实测 20 条/页
+  - 限流：每个工具 1500 次/天（北京时间自然日统计），超限返回业务错误而非 JSON-RPC 错误
+- 配额说明：`fetch_all_news` 对金十设单源上限 `max(5, limit*0.30)`（limit=15 时为 5 条），
+  用于避免单源刷屏、保证多视角。MCP 调用成本不受影响（一次 `list_flash` 已覆盖该配额）。
 
 ---
 
@@ -147,7 +163,12 @@ live_server.py   ──┘  (实时数据服务器 :8800)
 - **中国股市惯例**：涨=红、跌=绿（实际值高于预期也用红/绿标识）。
 - **剔除人民币数据**：外汇/债券/央行/日历均不含 CNY/PBOC/LPR（用户 2026-08-19 要求）。
 - **输出位置**：生成文件统一到 `D:\workbuddy\输出文件`（用户偏好，禁写 C 盘）；预览 `http://localhost:8800/`。可用环境变量 `WORKBUDDY_OUTPUT`（HTML/Excel）、`WORKBUDDY_DATA_DIR`（daily_data.json）覆盖。
-- **API 密钥（可选，均环境变量化，公开副本无硬编码）**：`FRED_API_KEY` 走 FRED 官方 JSON API —— **不配也能用**，自动回退公开 CSV 通道、仍保持实时；`EIA_API_KEY` 取 EIA 原油库存 —— **不配则该板块回退快照**。设置：Windows `set FRED_API_KEY=你的key`，Linux/Mac `export FRED_API_KEY=你的key`。
+- **API 密钥（可选，均环境变量化，公开副本无硬编码）**：
+  - `FRED_API_KEY` 走 FRED 官方 JSON API —— **不配也能用**，自动回退公开 CSV 通道、仍保持实时；
+  - `EIA_API_KEY` 取 EIA 原油库存 —— **不配则该板块回退快照**；
+  - `JIN10_MCP_TOKEN` 走金十官方 MCP 快讯 —— **不配也能用**，自动回退 `flash_newest.js` 抓取，仍实时（仅丢失详情页 url）。
+  - 设置：Windows `set FRED_API_KEY=你的key`，Linux/Mac `export FRED_API_KEY=你的key`。
+  - 另：本机 `~/.workbuddy/mcp.json` 已配置 `jin10` MCP 服务器（供 WorkBuddy 会话直接调用 8 个工具），需在连接器管理页点「信任」后生效。
 - **Python 环境**：managed `python 3.13.12`；生成 Excel 必须用 venv `envs/default`（含 `xlsxwriter 3.2.9`），managed 环境缺该依赖。
 - **Excel 生成**：通过 `xlsxwriter`；若缺失则用纯标准库 `zipfile`+`xml` 兜底（见其他技能约定）。
 - **编码**：`live_server.py` 中文以 `\uXXXX` 转义存储（直接 Edit 改含中文字典会匹配失败，须脚本替换）。

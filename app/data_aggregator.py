@@ -724,13 +724,58 @@ def _infer_channel(text):
     return "快讯"
 
 
-def fetch_jin10_flash(limit=20):
-    """金十数据实时闪电讯 (Jin10 flash). 中文交易圈权威快讯源，无需密钥可达。
+# MCP 快讯无 important 字段，按重大事件关键词推断（与回退通道的服务端标记互补）
+_IMPORTANT_KEYWORDS = (
+    "美联储", "非农", "CPI", "加息", "降息", "利率决议", "欧洲央行", "日本央行",
+    "GDP", "通胀", "失业率", "地缘", "战争", "制裁", "关税", "降准", "PMI",
+)
 
-    返回统一的 news item 列表：{title, summary, source_name, published_at, url, important}
-    - type:0 普通快讯：data.title / data.content 为文本
-    - type:1 数据类：由 data.country+name+actual+consensus+previous 组合还原
+
+def _parse_iso_ts(s):
+    """ISO8601（如 2026-09-04T08:44:02+08:00）→ int 时间戳；失败返回 0。"""
+    if not s:
+        return 0
+    try:
+        return int(datetime.fromisoformat(str(s)).timestamp())
+    except Exception:
+        return 0
+
+
+def _jin10_mcp_to_news(raw_items, limit):
+    """把 MCP `list_flash` 原始 item({content, time, url}) 映射为统一 news item。
+
+    相对回退通道的增益：真实详情页 url、ISO 标准时间、结构化字段（无需正则逆向）。
     """
+    out = []
+    for it in raw_items or []:
+        if not isinstance(it, dict):
+            continue
+        text = _clean_html(str(it.get("content") or "")).strip()
+        if not text or len(text) < 4:
+            continue
+        # 金十为中英双语推送，剔除英文副本（同一事件已有中文条目）
+        if _cn_ratio(text) < 0.15:
+            continue
+        ts = _parse_iso_ts(it.get("time"))
+        out.append({
+            "title": text[:80] + ("..." if len(text) > 80 else ""),
+            "summary": text[:200],
+            "source_name": "金十数据",
+            "published_at": (datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+                             if ts else str(it.get("time") or "")[:16]),
+            "ts": ts,
+            # MCP 提供真实详情页链接，优于回退通道写死的首页
+            "url": it.get("url") or "https://www.jin10.com/",
+            "important": any(kw in text for kw in _IMPORTANT_KEYWORDS),
+            "channel": _infer_channel(text),
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _fetch_jin10_flash_legacy(limit=20):
+    """回退通道：抓 flash_newest.js（无需密钥，社群逆向端点）。MCP 不可用时使用。"""
     url = "https://www.jin10.com/flash_newest.js?t=%d" % int(time.time() * 1000)
     t0 = time.time()
     # 金十需带自身域 Referer，否则可能 403
@@ -804,6 +849,33 @@ def fetch_jin10_flash(limit=20):
     except Exception as e:
         HEALTH.record("jin10", False, str(e), latency)
         return []
+
+
+def fetch_jin10_flash(limit=20):
+    """金十数据实时快讯（中文交易圈权威源）。
+
+    双通道：
+      1) 官方 MCP（需 JIN10_MCP_TOKEN）——标准 MCP 流程，读 structuredContent，
+         结构化字段 + 真实详情页 url，不依赖正则逆向；
+      2) 回退 flash_newest.js 抓取——MCP 不可用或未配 token 时使用，仍保持实时。
+
+    返回统一 news item：{title, summary, source_name, published_at, ts, url, important, channel}
+    """
+    t0 = time.time()
+    # ---- 通道1：官方 MCP ----
+    try:
+        import jin10_mcp  # 延迟导入：MCP 模块异常不应拖垮整个聚合器
+        raw, err = jin10_mcp.fetch_flash_raw(limit=limit, max_pages=2, timeout=15)
+        if err:
+            raise RuntimeError(err)
+        items = _jin10_mcp_to_news(raw, limit)
+        if items:
+            HEALTH.record("jin10", True, latency_ms=int((time.time() - t0) * 1000))
+            return items
+    except Exception:
+        pass  # 落到回退通道
+    # ---- 通道2：回退原抓取 ----
+    return _fetch_jin10_flash_legacy(limit)
 
 
 # ------------------------------------------------------------
