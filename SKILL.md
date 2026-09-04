@@ -33,7 +33,7 @@ live_server.py   ──┘  (实时数据服务器 :8800)
 | `live_server.py` | 1333 | 实时数据服务器（ThreadingHTTPServer）。九大 API 端点 + HTML 静态服务；服务端对 `/api/advanced`、`/api/macro` 做硬超时兜底与缓存。 |
 | `advanced_data.py` | 845 | **进阶数据实时抓取核心**。FRED 双通道（官方 JSON API 优先，需可选 `FRED_API_KEY`；未配自动回退公开 CSV，仍实时）：TIPS/盈亏平衡/SOFR/WTI/Brent/广义美元/CPI/失业率；BIS SDMX WS_EER（8 经济体 NEER/REER）。无免费实时源的板块回退 `daily_data.json` 快照并标 `live=False`。 |
 | `data_aggregator.py` | 1845 | 多源行情/新闻聚合。Frankfurter(ECB) 外汇、Sina 商品/指数、Yahoo(DXY/BTC/VIX/罗素)、华尔街见闻快讯/文章/热榜、**金十快讯双通道（官方 MCP 优先，回退 flash_newest.js）**、Eastmoney、Tencent、FxMacro/ForexFactory 财经日历 actual 回填。 |
-| `jin10_mcp.py` | 233 | **金十数据 MCP 客户端**（2026-09-04 新增）。标准 MCP Streamable HTTP + Bearer：`initialize` → `notifications/initialized` → `tools/list` / `resources/list` → `tools/call`；协议 `2025-11-25`；SSE 响应解析；优先读 `structuredContent`；按 `cursor` / `next_cursor` / `has_more` 分页。需可选 `JIN10_MCP_TOKEN`。 |
+| `jin10_mcp.py` | 261 | **金十数据 MCP 客户端**（2026-09-04 新增）。标准 MCP Streamable HTTP + Bearer：`initialize` → `notifications/initialized` → `tools/list` / `resources/list` → `tools/call`；协议 `2025-11-25`；SSE 响应解析；优先读 `structuredContent`；按 `cursor` / `next_cursor` / `has_more` 分页。需可选 `JIN10_MCP_TOKEN`。 |
 | `generate_report.py` | 1554 | 统一生成器。读 `daily_data.json` → 生成霓虹 HTML 仪表盘 + Excel。含 `neonLine()` 通用霓虹渲染器、13 个 `renderAdv*` 面板、`fetchAdvanced()` 实时拉取。 |
 | `calendar_fetcher.py` | 1283 | 财经日历 actual 回填。按 `(country,event,time)` 三元组匹配，应用内置 `_FALLBACK_ACTUALS` + 外部 `calendar_actuals_extra.json`。 |
 | `sample_daily_data.json` | — | 示例数据入口（当前 2026-09-01 版）。重命名为 `daily_data.json` 即可让 App 离线跑起来。 |
@@ -153,6 +153,8 @@ live_server.py   ──┘  (实时数据服务器 :8800)
   - 结果优先读 `result.structuredContent`；`result.content` 仅作可读补充，**不作为机器解析来源**
   - 分页：请求 `cursor` / 响应 `data.next_cursor` / `data.has_more`；`list_flash` 实测 20 条/页
   - 限流：每个工具 1500 次/天（北京时间自然日统计），超限返回业务错误而非 JSON-RPC 错误
+  - **客户端实例复用**：`fetch_flash_raw` 等共用一个模块级单例（加锁、线程安全），握手每进程仅一次——首次 0.54s、后续 0.15s；调用失败时 `_reset_client()` 丢弃实例以便下次重新握手
+  - **限额核算**：前端自动更新间隔为 5 分钟 → 约 288 次/天，远低于 1500 限额；且握手不占用 `tools/call` 配额
 - 配额说明：`fetch_all_news` 对金十设单源上限 `max(5, limit*0.30)`（limit=15 时为 5 条），
   用于避免单源刷屏、保证多视角。MCP 调用成本不受影响（一次 `list_flash` 已覆盖该配额）。
 
