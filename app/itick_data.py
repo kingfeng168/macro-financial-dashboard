@@ -59,6 +59,17 @@ try:
 except ValueError:
     ITICK_RPM = 5
 
+# 给「按需请求」（如 /api/kline）预留的额度。
+# 背景：后台轮询若不设上限，会把整个 5 次/分钟的窗口占满，
+# 导致按需的 K 线请求永远拿不到配额（block=False 直接返回 None）。
+# 实测表现：现货黄金 K 线退回 Yahoo 的 GC=F 期货价(~4510)，
+# 与报价面板显示的 iTick 现货价(~4470) 自相矛盾。
+# 预留 1 个名额后，按需请求总能即时拿到额度，后台轮询只用到 4 次/分钟。
+try:
+    ITICK_RESERVE = max(0, min(int(os.environ.get("ITICK_RESERVE") or 1), ITICK_RPM - 1))
+except ValueError:
+    ITICK_RESERVE = 1
+
 REGION = "GB"          # 外汇/贵金属/能源统一市场代码
 DEFAULT_TIMEOUT = 12
 
@@ -221,8 +232,13 @@ _load_cache()
 # ------------------------------------------------------------
 # 令牌桶限流：滑动窗口，窗口内最多 ITICK_RPM 次
 # ------------------------------------------------------------
-def _limiter_acquire(block=True, timeout=90.0):
-    """返回 True 表示获得调用配额。block=True 时最多等待 timeout 秒。"""
+def _limiter_acquire(block=True, timeout=90.0, reserve=0):
+    """返回 True 表示获得调用配额。block=True 时最多等待 timeout 秒。
+
+    reserve: 预留不用的名额数。后台轮询传 ITICK_RESERVE，
+             这样窗口里永远留有余量给按需请求（K 线）即时取用。
+    """
+    cap = max(1, ITICK_RPM - reserve)
     t0 = _now()
     while True:
         with _lock:
@@ -230,7 +246,7 @@ def _limiter_acquire(block=True, timeout=90.0):
             # 丢弃窗口外的记录（窗口 62s，留 2s 时钟/网络余量）
             while _calls and now - _calls[0] > 62.0:
                 _calls.pop(0)
-            if len(_calls) < ITICK_RPM:
+            if len(_calls) < cap:
                 _calls.append(now)
                 return True
             wait = 62.0 - (now - _calls[0]) + 0.25
@@ -291,13 +307,13 @@ def _get(path, timeout=DEFAULT_TIMEOUT):
     return True, j.get("data"), None
 
 
-def _request(path, timeout=DEFAULT_TIMEOUT, block=True):
-    """限流 + 退避 + 统计包装。"""
+def _request(path, timeout=DEFAULT_TIMEOUT, block=True, reserve=0):
+    """限流 + 退避 + 统计包装。reserve 见 _limiter_acquire。"""
     if _now() < _backoff_until:
         if not block:
             return False, None, "\u9000\u907f\u4e2d"
         time.sleep(min(_backoff_until - _now(), 62.0))
-    if not _limiter_acquire(block=block):
+    if not _limiter_acquire(block=block, reserve=reserve):
         return False, None, "\u914d\u989d\u7b49\u5f85\u8d85\u65f6"
     ok, data, err = _get(path, timeout=timeout)
     with _lock:
@@ -313,13 +329,17 @@ def _request(path, timeout=DEFAULT_TIMEOUT, block=True):
 # ------------------------------------------------------------
 # 报价获取与归一化
 # ------------------------------------------------------------
-def fetch_quote(name, block=True):
-    """拉取单个日报品种的报价并写入缓存。返回归一化 quote 或 None。"""
+def fetch_quote(name, block=True, reserve=0):
+    """拉取单个日报品种的报价并写入缓存。返回归一化 quote 或 None。
+
+    后台轮询应传 reserve=ITICK_RESERVE，给按需请求留额度。
+    """
     mapping = SYMBOLS.get(name)
     if not mapping:
         return None
     code = mapping[0]
-    ok, d, err = _request("/forex/quote?region=%s&code=%s" % (REGION, code), block=block)
+    ok, d, err = _request("/forex/quote?region=%s&code=%s" % (REGION, code),
+                          block=block, reserve=reserve)
     if not ok or not d:
         return None
 
@@ -371,17 +391,15 @@ def fetch_quote(name, block=True):
     return q
 
 
-def fetch_kline(name, tf="1d", limit=100):
-    """按需拉取 K 线（消耗 1 次调用额度，用于 /api/kline 兜底）。
-    返回 [{t, o, h, l, c, v}] 按时间升序，或 None。"""
-    mapping = SYMBOLS.get(name)
-    if not mapping:
-        return None
-    code = mapping[0]
-    ktype = KTYPE.get(tf, 8)
+def _fetch_kline_raw(code, ktype, limit):
+    """拉一次原始 K 线并归一化。返回 [{t,o,h,l,c,v}] 升序，或 None。
+
+    走 reserve=0（可动用全部额度）且允许短暂等待：K 线结果有 60s 缓存，
+    偶发等待十几秒可接受；拿不到再回落到原有链路。
+    """
     ok, d, err = _request(
         "/forex/kline?region=%s&code=%s&kType=%d&limit=%d" % (REGION, code, ktype, limit),
-        block=False)
+        block=True, timeout=15, reserve=0)
     if not ok or not isinstance(d, list):
         return None
     out = []
@@ -399,6 +417,49 @@ def fetch_kline(name, tf="1d", limit=100):
             continue
     out.sort(key=lambda x: x["t"])
     return out or None
+
+
+def _aggregate(bars, n):
+    """把 n 根小周期 K 线合成 1 根大周期（按时间升序分组）。"""
+    if not bars or n <= 1:
+        return bars
+    out = []
+    for i in range(0, len(bars), n):
+        ch = bars[i:i + n]
+        if not ch:
+            continue
+        out.append({
+            "t": ch[0]["t"],
+            "o": ch[0]["o"],
+            "h": max(x["h"] for x in ch),
+            "l": min(x["l"] for x in ch),
+            "c": ch[-1]["c"],
+            "v": sum(x["v"] for x in ch),
+        })
+    return out or None
+
+
+# 实测：iTick 外汇的 kType=6(2h) / 7(4h) 会返回**成功但 data 为空**，
+# 并非限流或报错（ok 计数会 +1）。因此这两个周期直接用 1h 聚合而来，
+# 只花 1 次调用，避免"先试 4h 失败再试 1h"浪费两次额度。
+_UNSUPPORTED = {6: (5, 2), 7: (5, 4)}   # kType -> (用哪个细粒度, 聚合几根)
+
+
+def fetch_kline(name, tf="1d", limit=100):
+    """按需拉取 K 线（消耗 1 次调用额度，用于 /api/kline 兜底）。
+    返回 [{t, o, h, l, c, v}] 按时间升序，或 None。"""
+    mapping = SYMBOLS.get(name)
+    if not mapping:
+        return None
+    code = mapping[0]
+    ktype = KTYPE.get(tf, 8)
+
+    if ktype in _UNSUPPORTED:
+        src_ktype, factor = _UNSUPPORTED[ktype]
+        raw = _fetch_kline_raw(code, src_ktype, limit * factor)
+        return _aggregate(raw, factor)
+
+    return _fetch_kline_raw(code, ktype, limit)
 
 
 # ------------------------------------------------------------
@@ -433,7 +494,8 @@ def _worker_loop():
         if not name:
             time.sleep(5)
             continue
-        q = fetch_quote(name, block=True)
+        # reserve=ITICK_RESERVE：给按需请求（K 线）留出额度，别把窗口占满
+        q = fetch_quote(name, block=True, reserve=ITICK_RESERVE)
         if q:
             consecutive_fail = 0
             # 正常节奏：让限流器自然分配调用，避免空转
@@ -468,15 +530,17 @@ def start_background():
 
 
 def bootstrap(max_calls=None):
-    """启动时同步预热，保证首屏就有数据。默认消耗 1 分钟额度（5 次）。
-    按权重优先：贵金属/能源先取。"""
+    """启动时同步预热，保证首屏就有数据。按权重优先：贵金属/能源先取。
+
+    默认只消耗 ITICK_RPM - ITICK_RESERVE 次，给按需请求留额度。
+    """
     if not ITICK_TOKEN:
         return 0
-    budget = max_calls if max_calls is not None else ITICK_RPM
+    budget = max_calls if max_calls is not None else max(1, ITICK_RPM - ITICK_RESERVE)
     ordered = sorted(SYMBOLS.items(), key=lambda kv: -kv[1][1])
     got = 0
     for name, _ in ordered[:budget]:
-        if fetch_quote(name, block=False):
+        if fetch_quote(name, block=False, reserve=ITICK_RESERVE):
             got += 1
     return got
 
@@ -507,6 +571,7 @@ def status():
         "running": snap.get("running", False),
         "base": ITICK_BASE,
         "rpm": ITICK_RPM,
+        "reserve": ITICK_RESERVE,
         "symbols": len(SYMBOLS),
         "cached": cached,
         "persisted": os.path.exists(CACHE_FILE),

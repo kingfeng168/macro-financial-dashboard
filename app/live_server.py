@@ -422,9 +422,26 @@ def compute_forex_quotes(rates, prev_rates):
 # ============================================================
 #  In-memory price history (for minute-level K-line)
 # ============================================================
-def record_price(name, price):
-    """Record a price tick for later K-line aggregation."""
+def _itick_prefer_set():
+    """返回「以 iTick 现货口径为准」的品种集合（模块不可用时返回空集）。"""
+    try:
+        import itick_data
+        return set(getattr(itick_data, "PREFER", ()) or ())
+    except Exception:
+        return set()
+
+
+def record_price(name, price, source=None):
+    """Record a price tick for later K-line aggregation.
+
+    \u53e3\u5f84\u4e00\u81f4\u6027\u4fdd\u62a4\uff1aPREFER \u54c1\u79cd\uff08\u73b0\u8d27\u9ec4\u91d1/\u767d\u94f6\uff09\u4ee5 iTick \u73b0\u8d27\u4e3a\u51c6\uff0c
+    \u56e0\u6b64**\u53ea\u8bb0\u5f55 itick \u6e90\u7684\u4ef7\u683c**\u3002\u5426\u5219\u5f53 iTick \u5feb\u7167\u7a7a\u7f3e\u800c\u56de\u843d\u65b0\u6d6a\u65f6\uff0c
+    COMEX \u671f\u8d27\u4ef7\uff08\u6bd4\u73b0\u8d27\u9ad8\u7ea6 1%\uff09\u4f1a\u88ab\u6df7\u8fdb\u540c\u4e00\u6761\u4ef7\u683c\u5386\u53f2\uff0c
+    \u5bfc\u81f4\u8d70\u52bf\u56fe\u5728\u4e24\u4e2a\u4e0d\u540c\u6807\u7684\u4e4b\u95f4\u8df3\u53d8\u3002
+    """
     if not price or price <= 0:
+        return
+    if name in _itick_prefer_set() and source != "itick":
         return
     ts = time.time()
     with _history_lock:
@@ -1105,7 +1122,7 @@ def get_quotes(force=False):
     # --- Record prices into in-memory history for K-line synthesis ---
     for nm, q in result.items():
         if q.get("price"):
-            record_price(nm, q["price"])
+            record_price(nm, q["price"], q.get("source"))
 
     _qcache = result
     _qtime = time.time()
@@ -1178,6 +1195,21 @@ def get_kline(name, tf="1d", force=False):
                                    "low": min(x["low"] for x in ch),
                                    "close": ch[-1]["close"]})
                 kl = ag
+
+    # 2.5 iTick K 线（真实 OHLC，非阻塞：缺额度则静默跳过继续走原链路）
+    #  - PREFER 品种（现货黄金/白银）：优先用 iTick，保证与展示的现货价口径一致
+    #  - 其余品种：仅当 Yahoo/Sina 都没拿到时才兜底，避免无谓消耗 5 次/分钟额度
+    try:
+        import itick_data
+        if getattr(itick_data, "ITICK_TOKEN", ""):
+            _prefer_kl = name in getattr(itick_data, "PREFER", ())
+            if _prefer_kl or not kl:
+                _raw = itick_data.fetch_kline(name, tf, 200)
+                if _raw:
+                    kl = [{"time": x["t"], "open": x["o"], "high": x["h"],
+                           "low": x["l"], "close": x["c"]} for x in _raw][-200:]
+    except Exception:
+        pass
 
     # 3. In-memory price history (minute-level)
     if not kl:

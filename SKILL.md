@@ -30,10 +30,10 @@ live_server.py   ──┘  (实时数据服务器 :8800)
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `live_server.py` | 1371 | 实时数据服务器（ThreadingHTTPServer）。十大 API 端点 + HTML 静态服务；服务端对 `/api/advanced`、`/api/macro` 做硬超时兜底与缓存；启动时拉起 iTick 后台轮询。 |
+| `live_server.py` | 1403 | 实时数据服务器（ThreadingHTTPServer）。十大 API 端点 + HTML 静态服务；服务端对 `/api/advanced`、`/api/macro` 做硬超时兜底与缓存；启动时拉起 iTick 后台轮询。 |
 | `advanced_data.py` | 845 | **进阶数据实时抓取核心**。FRED 双通道（官方 JSON API 优先，需可选 `FRED_API_KEY`；未配自动回退公开 CSV，仍实时）：TIPS/盈亏平衡/SOFR/WTI/Brent/广义美元/CPI/失业率；BIS SDMX WS_EER（8 经济体 NEER/REER）。无免费实时源的板块回退 `daily_data.json` 快照并标 `live=False`。 |
 | `data_aggregator.py` | 1966 | 多源行情/新闻聚合。Frankfurter(ECB) 外汇、Sina 商品/指数、Yahoo(DXY/BTC/VIX/罗素)、华尔街见闻快讯/文章/热榜、**金十快讯双通道（官方 MCP 优先，回退 flash_newest.js）**、Eastmoney、Tencent、FxMacro/ForexFactory 财经日历 actual 回填、**iTick 三重作用（口径优先 / 缺口补位 / 交叉校验）**。 |
-| `itick_data.py` | 469 | **iTick 行情源**（2026-09-04 新增）。后台常驻轮询 + 内存快照架构，绕开免费套餐 5 次/分钟限流。滑动窗口令牌桶限流、按权重轮转刷新（贵金属/能源权重 2）、429 自动退避、kline 按需兜底。见 §6.1。 |
+| `itick_data.py` | 605 | **iTick 行情源**（2026-09-04 新增）。后台常驻轮询 + 内存快照架构，绕开免费套餐 5 次/分钟限流。滑动窗口令牌桶限流（含 `ITICK_RESERVE` 额度预留）、按权重轮转刷新（贵金属/能源权重 2）、429 自动退避、快照落盘、kline 按需兜底（2h/4h 用 1h 聚合）。见 §6.1。 |
 | `jin10_mcp.py` | 261 | **金十数据 MCP 客户端**（2026-09-04 新增）。标准 MCP Streamable HTTP + Bearer：`initialize` → `notifications/initialized` → `tools/list` / `resources/list` → `tools/call`；协议 `2025-11-25`；SSE 响应解析；优先读 `structuredContent`；按 `cursor` / `next_cursor` / `has_more` 分页。需可选 `JIN10_MCP_TOKEN`。 |
 | `generate_report.py` | 1666 | 统一生成器。读 `daily_data.json` → 生成霓虹 HTML 仪表盘 + Excel。含 `neonLine()` 通用霓虹渲染器、13 个 `renderAdv*` 面板、`fetchAdvanced()` 实时拉取、`_itickBadge()` 来源徽章。 |
 | `calendar_fetcher.py` | 1283 | 财经日历 actual 回填。按 `(country,event,time)` 三元组匹配，应用内置 `_FALLBACK_ACTUALS` + 外部 `calendar_actuals_extra.json`。 |
@@ -221,6 +221,29 @@ iTick **免费套餐实测硬性限流 5 次/分钟**（第 6 次起返回 `429 
 - 重启时若上一实例刚用掉当分钟额度，bootstrap 会拿到 429 → 自动退避约 62s 后由 worker 补齐，
   期间贵金属**自动回落新浪期货**（兜底生效，行情不中断）。
 
+#### K 线接入（`live_server.get_kline()` 第 2.5 层）
+链路：`1 新浪(仅外汇)` → `2 Yahoo(全品种, 常 403)` → **`2.5 iTick`** → `3 内存历史` → `4 daily_data 兜底`。
+- PREFER 品种（现货黄金/白银）**优先用 iTick**，保证 K 线与报价同口径；
+  其余品种仅当新浪/Yahoo 都拿不到时才兜底，省额度。
+- 非阻塞 + 有兜底：拿不到额度就静默跳过继续走原链路。
+
+**踩坑：`kType=6`(2h) / `7`(4h) 在外汇上返回「成功但 data 为空」**——不是限流也不是报错
+（`ok` 计数会 +1，极易误判）。因此这两个周期直接用 **1h 聚合**（`_aggregate()`），只花 1 次调用。
+
+#### 额度预留：`ITICK_RESERVE`（默认 1，关键）
+**踩过的坑**：后台轮询会占满 5 次/分钟窗口，而按需 K 线请求用 `block=False`（不等待），
+结果**永远拿不到额度**——表现为黄金 K 线始终回落到 Yahoo 期货价，与报价面板的现货价打架。
+修复：后台轮询最多用 `RPM - RESERVE` 次，窗口里始终留名额给按需请求。
+- 后台轮询 4 次/分钟，按需请求恒有 1 次立即可用；
+- 代价：23 品种轮转周期 4.6 分钟 → 5.8 分钟，核心品种仍 ~95s；
+- 不需要 K 线时设 `ITICK_RESERVE=0` 可让报价刷新更快。
+
+#### 口径一致性：`record_price(name, price, source)`
+**踩过的坑**：口径切换后，内存价格历史会同时混入新浪期货价(~4515) 与 iTick 现货价(~4470)，
+聚合出的 1 小时 K 线在两个标的之间跳变。
+修复：**PREFER 品种只记录 `source=itick` 的价格**——既然以现货为准，走势图就只画现货价，
+iTick 暂不可用时不更新，也不混入期货价。非 PREFER 品种行为不变。
+
 #### 前端展示（`generate_report.py`）
 - `_itickBadge(q)` 三态徽章：`itick-pref`（青色霓虹「iTick现货」，hover 显示被覆盖的期货价与分歧）、
   `itick-warn`（琥珀色，分歧 ≥0.5% 时高亮）、`itick-ok`（灰色，正常参考价）。
@@ -239,7 +262,8 @@ iTick **免费套餐实测硬性限流 5 次/分钟**（第 6 次起返回 `429 
   - `JIN10_MCP_TOKEN` 走金十官方 MCP 快讯 —— **不配也能用**，自动回退 `flash_newest.js` 抓取，仍实时（仅丢失详情页 url）；
   - `ITICK_TOKEN` 走 iTick 行情源 —— **不配则该源整体禁用**（模块 `enabled=False`，主源照常工作，行情不中断）。
     可选配 `ITICK_BASE`（默认 `https://api-free.itick.org`，付费版改 `https://api.itick.org`）、
-    `ITICK_RPM`（默认 5，付费套餐可设 120/600/1200）。
+    `ITICK_RPM`（默认 5，付费套餐可设 120/600/1200）、
+    `ITICK_RESERVE`（默认 1，给按需请求预留的额度；设 0 则后台轮询占满全部额度）。
   - 设置：Windows `set FRED_API_KEY=你的key`，Linux/Mac `export FRED_API_KEY=你的key`。
   - 另：本机 `~/.workbuddy/mcp.json` 已配置 `jin10` MCP 服务器（供 WorkBuddy 会话直接调用 8 个工具），需在连接器管理页点「信任」后生效。
 - **Python 环境**：managed `python 3.13.12`；生成 Excel 必须用 venv `envs/default`（含 `xlsxwriter 3.2.9`），managed 环境缺该依赖。
