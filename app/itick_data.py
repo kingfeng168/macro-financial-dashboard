@@ -130,6 +130,15 @@ PREFER_MAX_STALE = 600
 # ------------------------------------------------------------
 _ctx = ssl._create_unverified_context()
 _lock = threading.RLock()
+
+# 快照持久化：重启后立即可用，避免贵金属闪回期货价。
+# 场景：桌面 bat 每次启动都会重启进程；若此时上一实例刚用掉当分钟额度，
+# bootstrap 会拿到 429，缓存为空 -> 现货黄金短暂显示新浪 COMEX 期货价（约 1% 闪跳）。
+# 落盘后重启能立刻读到上次快照，只要未超过 PREFER_MAX_STALE 就继续用现货价。
+_DIR = os.path.dirname(os.path.abspath(__file__))
+_DATA_DIR = os.environ.get("WORKBUDDY_DATA_DIR") or _DIR
+CACHE_FILE = os.path.join(_DATA_DIR, "itick_cache.json")
+
 _cache = {}          # name -> {price, prevClose, ..., _ts, _code}
 _calls = []          # 滑动窗口内的调用时间戳
 _worker = None       # 后台线程
@@ -152,6 +161,61 @@ def _now():
 
 def _stamp():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ------------------------------------------------------------
+# 快照持久化
+# ------------------------------------------------------------
+def _load_cache():
+    """启动时从磁盘恢复上次快照。仅恢复结构完整的条目，任何异常都不影响主流程。"""
+    global _cache
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return 0
+        items = raw.get("quotes") if isinstance(raw.get("quotes"), dict) else raw
+        n = 0
+        with _lock:
+            for name, q in items.items():
+                if not isinstance(q, dict):
+                    continue
+                if name not in SYMBOLS:
+                    continue          # 映射已变更的旧条目直接丢弃
+                try:
+                    price = float(q.get("price"))
+                except (TypeError, ValueError):
+                    continue
+                if price <= 0:
+                    continue
+                # 恢复的 _ts 保留原值，staleSec 才会如实反映真实年龄；
+                # 超过 PREFER_MAX_STALE 的条目自然不会被用于口径覆盖。
+                q["_ts"] = float(q.get("_ts") or 0)
+                _cache[name] = q
+                n += 1
+        return n
+    except Exception:
+        return 0
+
+
+def _save_cache():
+    """写盘。文件很小（23 条），每次更新直接写；失败静默忽略。"""
+    try:
+        with _lock:
+            payload = {
+                "saved_at": _stamp(),
+                "quotes": {k: v for k, v in _cache.items()},
+            }
+        tmp = CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, CACHE_FILE)
+        return True
+    except Exception:
+        return False
+
+
+_load_cache()
 
 
 # ------------------------------------------------------------
@@ -303,6 +367,7 @@ def fetch_quote(name, block=True):
     with _lock:
         q["_ts"] = _now()
         _cache[name] = q
+    _save_cache()
     return q
 
 
@@ -444,6 +509,7 @@ def status():
         "rpm": ITICK_RPM,
         "symbols": len(SYMBOLS),
         "cached": cached,
+        "persisted": os.path.exists(CACHE_FILE),
         "ok": snap.get("ok", 0),
         "fail": snap.get("fail", 0),
         "throttled": snap.get("throttled", 0),
