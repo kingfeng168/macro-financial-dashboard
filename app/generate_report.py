@@ -1273,6 +1273,9 @@ function renderAdvEiaIea(sec){
 function fetchAdvanced(){
   var fa=document.getElementById('advFetchedAt');
   if(!serverOnline){if(fa)fa.textContent='服务器未连接 · 显示下方静态快照';return;}
+  /* 在飞守卫：请求进行中再点/自动刷新触发，直接忽略而不是 abort 掉上一次。
+     否则用户手动点击会被 5 分钟一次的 doFullUpdate 打断，报"signal is aborted"。 */
+  if(_reqCtl['advanced']){if(fa)fa.textContent='正在获取进阶数据，请稍候…（不重复发起）';return;}
   if(fa)fa.textContent='获取中...';
   _fetchJSON('advanced',BASE+'/api/advanced?refresh=1',30000).then(function(d){
     if(fa)fa.textContent='实时数据获取于: '+(d.fetched_at||'--')+' · 来源: '+(d.source||'');
@@ -1293,6 +1296,10 @@ function fetchAdvanced(){
     try{renderAdvEiaOil(S.eia_oil);}catch(e){console.error('renderAdvEiaOil',e);}
     try{renderAdvEiaIea(S.eia_iea_oil);}catch(e){console.error('renderAdvEiaIea',e);}
   }).catch(function(e){
+    var r=(e&&e._reason)||'';
+    if(r==='superseded'){if(fa)fa.textContent='已被新一次刷新取代 · 以上为最新数据';return;}
+    if(r==='timeout'){if(fa)fa.textContent='获取超时（30 秒），可稍后重试 · 显示下方静态快照';return;}
+    if(r==='aborted'){if(fa)fa.textContent='请求被中止 · 可重新点击刷新';return;}
     if(fa)fa.textContent='获取失败: '+((e&&e.message)||e)+' · 显示下方静态快照';
   });
 }
@@ -1300,10 +1307,10 @@ function fetchAdvanced(){
 var _reqCtl={};var _reqSeq={};var _busy={};var _pending={};var _lastQuotesAt=0;var _lastQuotesMs=0;
 function _fetchJSON(mod,url,timeoutMs){
   timeoutMs=timeoutMs||20000;
-  if(_reqCtl[mod]){try{_reqCtl[mod].abort();}catch(e){}}
+  if(_reqCtl[mod]){var _old=_reqCtl[mod];_old._reason='superseded';try{_old.abort();}catch(e){}}
   var seq=(_reqSeq[mod]=(_reqSeq[mod]||0)+1);
   var ctl=new AbortController();_reqCtl[mod]=ctl;
-  var timer=setTimeout(function(){try{ctl.abort();}catch(e){}},timeoutMs);
+  var timer=setTimeout(function(){ctl._reason='timeout';try{ctl.abort();}catch(e){}},timeoutMs);
   return fetch(url,{cache:'no-store',signal:ctl.signal}).then(function(r){
     clearTimeout(timer);
     if(!r.ok)throw new Error('HTTP '+r.status);
@@ -1312,7 +1319,10 @@ function _fetchJSON(mod,url,timeoutMs){
     if(_reqSeq[mod]!==seq)throw new Error('stale-response');
     if(_reqCtl[mod]===ctl)_reqCtl[mod]=null;
     return d;
-  },function(e){clearTimeout(timer);if(_reqCtl[mod]===ctl)_reqCtl[mod]=null;throw e;});
+  },function(e){clearTimeout(timer);if(_reqCtl[mod]===ctl)_reqCtl[mod]=null;
+    /* 把中止原因透传给调用方：superseded(被新请求取代)/timeout(超时)，避免竞态被误报成故障 */
+    try{e._reason=ctl._reason||((e&&e.name==='AbortError')?'aborted':undefined);}catch(_e){}
+    throw e;});
 }
 function _exclusive(mod,fn){
   if(_busy[mod]){_pending[mod]=true;return;}

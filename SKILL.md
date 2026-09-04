@@ -35,7 +35,7 @@ live_server.py   ──┘  (实时数据服务器 :8800)
 | `data_aggregator.py` | 1999 | 多源行情/新闻聚合。Frankfurter(ECB) 外汇、Sina 商品/指数、Yahoo(DXY/BTC/VIX/罗素)、华尔街见闻快讯/文章/热榜、**金十快讯双通道（官方 MCP 优先，回退 flash_newest.js）**、Eastmoney、Tencent、FxMacro/ForexFactory 财经日历 actual 回填、**iTick 三重作用（口径优先 / 缺口补位 / 交叉校验）**。 |
 | `itick_data.py` | 726 | **iTick 行情源**（2026-09-04 新增）。后台常驻轮询 + 内存快照架构，绕开免费套餐 5 次/分钟限流。滑动窗口令牌桶限流（含 `ITICK_RESERVE` 额度预留）、按权重轮转刷新（贵金属/能源权重 2）、429 自动退避、快照落盘、kline 按需兜底（2h/4h 用 1h 聚合）、`CROSS_CALIBER` 跨口径登记、`fetch_series_bundle()` 一次调用产出月度+日线+收盘（用于报表口径校正）。见 §6.1。 |
 | `jin10_mcp.py` | 261 | **金十数据 MCP 客户端**（2026-09-04 新增）。标准 MCP Streamable HTTP + Bearer：`initialize` → `notifications/initialized` → `tools/list` / `resources/list` → `tools/call`；协议 `2025-11-25`；SSE 响应解析；优先读 `structuredContent`；按 `cursor` / `next_cursor` / `has_more` 分页。需可选 `JIN10_MCP_TOKEN`。 |
-| `generate_report.py` | 1868 | 统一生成器。读 `daily_data.json` → 生成霓虹 HTML 仪表盘 + Excel。含 `neonLine()` 通用霓虹渲染器、13 个 `renderAdv*` 面板、`fetchAdvanced()` 实时拉取、`_itickBadge()` 五态来源徽章、`_apply_spot_caliber()` 构建期口径校正（历史曲线与实时报价同口径）。 |
+| `generate_report.py` | 1878 | 统一生成器。读 `daily_data.json` → 生成霓虹 HTML 仪表盘 + Excel。含 `neonLine()` 通用霓虹渲染器、13 个 `renderAdv*` 面板、`fetchAdvanced()` 实时拉取、`_itickBadge()` 五态来源徽章、`_apply_spot_caliber()` 构建期口径校正（历史曲线与实时报价同口径）。 |
 | `calendar_fetcher.py` | 1283 | 财经日历 actual 回填。按 `(country,event,time)` 三元组匹配，应用内置 `_FALLBACK_ACTUALS` + 外部 `calendar_actuals_extra.json`。 |
 | `sample_daily_data.json` | — | 示例数据入口（当前 2026-09-01 版）。重命名为 `daily_data.json` 即可让 App 离线跑起来。 |
 | `启动全球金融日报APP.bat` / `停止全球金融日报APP.bat` / `open_browser_delayed.bat` | — | Windows 一键启动/停止（pythonw 静默后台，端口 8800，延迟 5s 开浏览器）。 |
@@ -302,6 +302,25 @@ iTick 暂不可用时不更新，也不混入期货价。非 PREFER 品种行为
 
 > 判据：一个数据块若被多个面板复用（图 + 统计卡 + 导出），错一处会污染全部下游。
 > 修口径时要顺藤摸瓜查**所有**消费方。
+
+#### 请求竞态不得误报为故障（v1.3.4，前端）
+**踩过的坑**：「刷新进阶数据」报 `获取失败: signal is aborted without reason`。
+排查发现服务端 8 秒就正常返回——根因在**前端**：`fetchAdvanced()` 有两个调用方
+（手动按钮 + `doFullUpdate()` 每 5 分钟自动刷新）共用同一个请求 key `'advanced'`，
+而 `_fetchJSON` 开头会 `abort()` 掉同 key 的上一次请求。用户手动点按钮后 30 秒内
+恰好赶上自动刷新，上一次就被 abort，竞态被误报成故障。
+
+处理（三处）：
+1. **在飞守卫**：`fetchAdvanced()` 开头检查 `_reqCtl['advanced']`，请求进行中再触发
+   直接忽略并提示「正在获取进阶数据，请稍候…」，不再 abort；
+2. **中止原因透传**：`_fetchJSON` 在 abort 前给 controller 挂 `_reason`
+   （`superseded`=被新请求取代 / `timeout`=超时），并在错误分支透传给调用方；
+3. **分类提示**：catch 里按 `_reason` 区分——superseded 显示「已被新一次刷新取代」、
+   timeout 显示「获取超时（30 秒）」、其余才显示「获取失败: 原始错误」。
+
+验证：`_beh.js` 行为测试 7/7（superseded/timeout/HTTP500/在飞守卫/提示文案）。
+> 判据：**AbortError 不等于故障**。凡是"自己的代码主动 abort"的场景（防堆积、被新请求
+> 取代、超时重试），都要给用户一个与真实故障不同的、可理解的提示。
 
 #### 口径优先于新鲜度（语义变更）
 初版 `PREFER_MAX_STALE` 超时后会**回落主源**，但主源是期货——回落拿不到"更新鲜的现货价"，
