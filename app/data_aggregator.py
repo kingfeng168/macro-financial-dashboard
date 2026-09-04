@@ -524,6 +524,46 @@ def fetch_yahoo_quotes(symbols_map):
     return result
 
 
+# ---------- iTick 交叉校验源 ----------
+def _itick_module():
+    """延迟导入 itick_data：模块缺失/异常绝不拖垮主聚合流程。"""
+    try:
+        import itick_data
+        return itick_data
+    except Exception:
+        return None
+
+
+def fetch_itick_quotes():
+    """读取 iTick 后台轮询快照。
+
+    关键设计：iTick 免费套餐实测硬性限流 5 次/分钟，绝不能放进请求链路。
+    itick_data 由后台守护线程按令牌桶节奏轮转刷新，本函数只读内存快照，
+    因此 **零 API 调用、零网络延迟、永不触发 429**。
+
+    Returns (quotes, state)：quotes 为标准 quote 结构并附 itick 独有字段。
+    """
+    mod = _itick_module()
+    if mod is None:
+        HEALTH.record("itick", False, "itick_data \u6a21\u5757\u4e0d\u53ef\u7528")
+        return {}, None
+    if not getattr(mod, "ITICK_TOKEN", ""):
+        HEALTH.record("itick", False, "ITICK_TOKEN \u672a\u914d\u7f6e")
+        return {}, None
+    try:
+        snap = mod.get_snapshot()
+        state = mod.status()
+    except Exception as e:
+        HEALTH.record("itick", False, str(e))
+        return {}, None
+    out = {}
+    for name, q in (snap or {}).items():
+        if q and q.get("price"):
+            out[name] = q
+    HEALTH.record("itick", bool(out), "" if out else "\u5feb\u7167\u4e3a\u7a7a\uff08\u540e\u53f0\u9884\u70ed\u4e2d\uff09", latency_ms=0)
+    return out, state
+
+
 # ---------- 聚合行情 ----------
 def fetch_all_quotes(force=False):
     """Main entry: aggregate quotes from all sources with failover (两阶段并发).
@@ -531,8 +571,15 @@ def fetch_all_quotes(force=False):
     Phase 1: 主源全部并发拉取（外汇 Frankfurter / 商品新浪 / 全球指数腾讯+新浪 /
               A股东财 / 特殊品种 Yahoo），网络延迟从串行叠加降为单次最大值。
     Phase 2: 根据 Phase 1 缺失项并发补漏（新浪外汇 / Yahoo 商品+指数 / 腾讯A股 / 新浪上证）。
+    Phase 3: iTick —— 读后台轮询快照（零 API 调用，iTick 免费套餐限流 5 次/分钟，
+             禁止进请求链路）。三重作用：
+             ① 主源全挂时补位；
+             ② 口径优先：PREFER 集合（现货黄金/白银）以 iTick 现货价覆盖主源期货价，
+                与 MT4 实盘 XAUUSD/XAGUSD 一致；快照过期自动回落主源；
+             ③ 其余品种挂 quote["itick"] 分歧度做交叉校验。
 
-    Returns {"quotes": {name: quote}, "sources": {source: ok?}, "health": snapshot}
+    Returns {"quotes": {name: quote}, "sources": {source: ok?}, "health": snapshot,
+             "itick": {state, filled, verified, preferred}}
     """
     result = {}
     sources_status = {}
@@ -609,12 +656,86 @@ def fetch_all_quotes(force=False):
         sources_status["sina_sh"] = bool(sina_sh)
         result.update(sina_sh)
 
+    # ---------- Phase 3: iTick 交叉校验 ----------
+    # 读后台轮询快照（零 API 调用）。两个作用：
+    #   ① 主源全挂时补位，保证贵金属/能源/外汇不缺项；
+    #   ② 对已有报价做交叉校验，把 iTick 价与分歧度挂到 quote["itick"] 供前端展示。
+    itick_state = None
+    itick_filled = 0
+    itick_verified = 0
+    try:
+        itick_quotes, itick_state = fetch_itick_quotes()
+    except Exception as e:
+        itick_quotes = {}
+        HEALTH.record("itick", False, str(e))
+
+    # 口径优先集合：这些品种 iTick 为现货口径，覆盖主源（新浪为期货口径）
+    mod = _itick_module()
+    prefer = set(getattr(mod, "PREFER", ()) or ()) if mod else set()
+    prefer_max_stale = int(getattr(mod, "PREFER_MAX_STALE", 300) or 300) if mod else 300
+
+    itick_preferred = 0
+    for name, q_it in (itick_quotes or {}).items():
+        cur = result.get(name)
+        div_pct = None
+        if cur is not None:
+            try:
+                p1 = float(cur.get("price"))
+                p2 = float(q_it.get("price"))
+                if p1 > 0 and p2 > 0:
+                    div_pct = round((p2 - p1) / p1 * 100, 3)
+            except (TypeError, ValueError):
+                div_pct = None
+
+        meta = {
+            "price": q_it.get("price"),
+            "code": q_it.get("itick_code"),
+            "divPct": div_pct,
+            "fetched_at": q_it.get("fetched_at"),
+            "staleSec": q_it.get("staleSec"),
+            "preferred": False,
+            "filled": False,
+        }
+
+        if cur is None:
+            # ① 主源全部失败 -> iTick 补位
+            filled = dict(q_it)
+            meta["filled"] = True
+            filled["itick"] = meta
+            result[name] = filled
+            itick_filled += 1
+            continue
+
+        if name in prefer and (q_it.get("staleSec") or 1e9) <= prefer_max_stale:
+            # ② 口径优先：以 iTick 现货价为准（与 MT4 实盘 XAUUSD/XAGUSD 一致）
+            #    快照过期则自动回落主源，保证行情不中断。
+            override = dict(q_it)
+            meta["preferred"] = True
+            meta["altPrice"] = cur.get("price")          # 被覆盖的期货价，保留可比对
+            meta["altSource"] = cur.get("source")
+            override["itick"] = meta
+            result[name] = override
+            itick_preferred += 1
+            continue
+
+        # ③ 交叉校验：把 iTick 价与分歧度挂到主报价上，供前端展示
+        cur["itick"] = meta
+        itick_verified += 1
+
+    sources_status["itick"] = bool(itick_quotes)
+
     return {
         "quotes": result,
         "sources": sources_status,
         "health": HEALTH.snapshot(),
         "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "count": len(result),
+        "itick": {
+            "state": itick_state,
+            "filled": itick_filled,
+            "verified": itick_verified,
+            "preferred": itick_preferred,
+        },
     }
 
 

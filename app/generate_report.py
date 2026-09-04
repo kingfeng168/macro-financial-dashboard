@@ -202,6 +202,10 @@ tr.clickable-row{cursor:pointer;transition:background .15s}tr.clickable-row:hove
 .ct-other{background:#8b949e22;color:#8b949e;border:1px solid #8b949e55}
 .source-ok{color:#52c41a}.source-fail{color:#f85149}.source-warn{color:#faad14}
 .data-source-tag{font-size:10px;padding:1px 5px;border-radius:3px;background:#21262d;color:#8b949e;margin-left:4px}
+.itick-tag{font-size:10px;padding:1px 5px;border-radius:3px;margin-left:4px;cursor:help;white-space:nowrap;letter-spacing:0.2px}
+.itick-pref{background:linear-gradient(135deg,#0d3b30,#06231c);color:#00f0ff;border:1px solid rgba(0,240,255,0.35);box-shadow:0 0 7px rgba(0,240,255,0.28);text-shadow:0 0 6px rgba(0,240,255,0.5)}
+.itick-ok{background:#21262d;color:#8b949e;border:1px solid #30363d}
+.itick-warn{background:#3d2f14;color:#ffb648;border:1px solid rgba(255,182,72,0.4);box-shadow:0 0 6px rgba(255,182,72,0.22)}
 .source-status-bar{font-size:11px;color:#8b949e;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 .source-status-bar span{display:flex;align-items:center;gap:4px}
 .rt-macro-title{font-size:13px;color:#58a6ff;font-weight:600;margin-bottom:10px;text-shadow:0 0 8px rgba(88,166,255,0.4)}
@@ -1135,6 +1139,7 @@ function fetchQuotes(){_exclusive('quotes',function(done){
   _fetchJSON('quotes',BASE+'/api/quotes?refresh=1',45000).then(function(payload){
     var data=payload.quotes||payload;var cnt=Object.keys(data).length;
     var metaSources=payload.sources||{};var metaHealth=payload.health||{};
+    window._itickState=(payload.itick&&payload.itick.state)||null;
     var fetchedAt=payload.fetched_at||'';
     var ms=Date.now()-t0;_lastQuotesMs=ms;_lastQuotesAt=Date.now();
     if(elDot)elDot.classList.remove('loading');
@@ -1156,7 +1161,13 @@ function fetchQuotes(){_exclusive('quotes',function(done){
     done();
   });
 });}
-function updateTableCells(name,q){var rows=document.querySelectorAll('#panel-overview tbody tr,#panel-forex tbody tr,#panel-commodities tbody tr,#panel-indices tbody tr,#panel-bonds tbody tr,#panel-macro tbody tr');rows.forEach(function(row){var cells=row.querySelectorAll('td');if(cells.length<4)return;var found=false;for(var i=0;i<Math.min(cells.length,3);i++){var t=cells[i].textContent.trim();if(t===name||t.indexOf(name)>=0||name.indexOf(t)>=0){found=true;break;}}if(!found)return;if(q.price!==null&&q.price!==undefined&&cells[2]){var srcTag=q.source&&q.source!=='daily_data_fallback'?'':'<span class="data-source-tag" title="来源:'+(q.source||'')+' '+(q.fetched_at||'')+'">回退</span>';cells[2].innerHTML=q.price.toFixed(4)+srcTag;}if(q.changePct!==null&&q.changePct!==undefined&&cells[3]){var cls=q.changePct>0?'pos':q.changePct<0?'neg':'flat';var sign=q.changePct>0?'+':'';cells[3].innerHTML='<span class="'+cls+'">'+sign+q.changePct.toFixed(2)+'</span>';}});}
+function _itickBadge(q){var m=q&&q.itick;if(!m||m.price===null||m.price===undefined)return '';var code=m.code||'iTick';var dv=m.divPct;
+if(m.preferred){return '<span class="itick-tag itick-pref" title="iTick \u73b0\u8d27\u4ef7 '+code+'&#10;\u88ab\u8986\u76d6\u7684\u671f\u8d27\u4ef7: '+(m.altPrice!=null?m.altPrice.toFixed(4):'-')+' ('+(m.altSource||'')+')&#10;\u5206\u6b67: '+(dv!=null?dv+'%':'-')+'&#10;\u66f4\u65b0: '+(m.fetchedAt||'')+'">iTick\u73b0\u8d27</span>';}
+if(m.filled){return '<span class="itick-tag itick-ok" title="\u4e3b\u6e90\u7f3a\u5931\uff0c\u7531 iTick '+code+' \u8865\u4f4d&#10;\u66f4\u65b0: '+(m.fetchedAt||'')+'">iTick\u8865\u4f4d</span>';}
+var warn=(dv!=null&&Math.abs(dv)>=0.5);
+var txt='iTick '+(m.price)+((dv!=null)?(' ('+(dv>0?'+':'')+dv+'%)'):'');
+return '<span class="itick-tag '+(warn?'itick-warn':'itick-ok')+'" title="iTick \u53c2\u8003\u4ef7 '+code+'&#10;\u4e3b\u6e90\u4ef7: '+(q.price)+'&#10;iTick \u4ef7: '+m.price+'&#10;\u5206\u6b67: '+(dv!=null?dv+'%':'-')+'&#10;\u66f4\u65b0: '+(m.fetchedAt||'')+((m.staleSec!=null)?(' ('+m.staleSec+'s\u524d)'):'')+'">'+txt+'</span>';}
+function updateTableCells(name,q){var rows=document.querySelectorAll('#panel-overview tbody tr,#panel-forex tbody tr,#panel-commodities tbody tr,#panel-indices tbody tr,#panel-bonds tbody tr,#panel-macro tbody tr');rows.forEach(function(row){var cells=row.querySelectorAll('td');if(cells.length<4)return;var found=false;for(var i=0;i<Math.min(cells.length,3);i++){var t=cells[i].textContent.trim();if(t===name||t.indexOf(name)>=0||name.indexOf(t)>=0){found=true;break;}}if(!found)return;if(q.price!==null&&q.price!==undefined&&cells[2]){var srcTag=q.source&&q.source!=='daily_data_fallback'?'':'<span class="data-source-tag" title="来源:'+(q.source||'')+' '+(q.fetched_at||'')+'">回退</span>';cells[2].innerHTML=q.price.toFixed(4)+srcTag+_itickBadge(q);}if(q.changePct!==null&&q.changePct!==undefined&&cells[3]){var cls=q.changePct>0?'pos':q.changePct<0?'neg':'flat';var sign=q.changePct>0?'+':'';cells[3].innerHTML='<span class="'+cls+'">'+sign+q.changePct.toFixed(2)+'</span>';}});}
 function updateStatCards(data){
   var map={'道琼斯指数':'道琼斯工业平均指数','美元指数':'美元指数','现货黄金':'现货黄金','WTI原油':'WTI原油','VIX恐慌指数':'美国VIX恐慌指数','SOFR隔夜':'SOFR隔夜'};
   document.querySelectorAll('.sc[data-label]').forEach(function(card){
@@ -1180,9 +1191,16 @@ function updateStatCards(data){
 }
 function renderQuoteSourceStatus(sources,health,fetchedAt){
   var el=document.getElementById('quoteSourceStatus');if(!el)return;
-  var labels={'frankfurter':'ECB外汇','sina_hf':'新浪商品','sina_int':'新浪指数','sina_fx':'新浪外汇','eastmoney':'东方财富','yahoo_special':'Yahoo','yahoo_indices':'Yahoo指数','yahoo_commodities':'Yahoo商品','daily_data_fallback':'日报快照'};
+  var labels={'frankfurter':'ECB外汇','sina_hf':'新浪商品','sina_int':'新浪指数','sina_fx':'新浪外汇','eastmoney':'东方财富','yahoo_special':'Yahoo','yahoo_indices':'Yahoo指数','yahoo_commodities':'Yahoo商品','tencent_indices':'腾讯指数','tencent_cn':'腾讯A股','sina_sh':'上证','daily_data_fallback':'日报快照'};
   var html='<span>行情源:</span>';
-  for(var k in sources){var ok=sources[k];var label=labels[k]||k;html+='<span class="'+(ok?'source-ok':'source-fail')+'">● '+label+'</span>';}
+  for(var k in sources){if(k==='itick')continue;var ok=sources[k];var label=labels[k]||k;html+='<span class="'+(ok?'source-ok':'source-fail')+'">● '+label+'</span>';}
+  var s=window._itickState;
+  if(s){
+    var tip='iTick \u540e\u53f0\u8f6e\u8be2 (限流 '+s.rpm+' \u6b21/分)&#10;已缓存 '+s.cached+'/'+s.symbols+' \u54c1\u79cd&#10;成功 '+s.ok+' · 失败 '+s.fail+' · 限流 '+s.throttled+'&#10;最旧数据 '+s.oldest_age_sec+'s 前 · 最新 '+s.newest_age_sec+'s 前';
+    html+='<span class="'+(s.cached>0?'source-ok':'source-fail')+'" title="'+tip+'">● iTick '+s.cached+'/'+s.symbols+'</span>';
+  }else if(sources['itick']!==undefined){
+    html+='<span class="'+(sources['itick']?'source-ok':'source-fail')+'">● iTick</span>';
+  }
   if(fetchedAt)html+='<span>获取于 '+fetchedAt+'</span>';
   el.innerHTML=html;}
 /* ===== 实时新闻：多源聚合 + 频道筛选（黄金/外汇/商品/原油为交易主线） ===== */

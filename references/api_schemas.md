@@ -69,6 +69,47 @@
 }
 ```
 
+## GET /api/itick
+```jsonc
+{
+  "status": "ok",
+  "state": {
+    "enabled": true,          // false = 未配 ITICK_TOKEN，该源整体禁用
+    "running": true,          // 后台轮询线程存活
+    "base": "https://api-free.itick.org",
+    "rpm": 5,                 // 每分钟调用上限（免费套餐 5）
+    "symbols": 23,            // 已映射品种总数
+    "cached": 23,             // 已缓存（有数据）品种数
+    "ok": 35, "fail": 0, "throttled": 0,
+    "last_error": "",
+    "newest_age_sec": 12,     // 最新一条数据的年龄
+    "oldest_age_sec": 128     // 最旧一条数据的年龄
+  },
+  "quotes": {
+    "现货黄金": {
+      "price": 4469.621, "prevClose": 4472.967, "change": -3.346, "changePct": -0.07,
+      "source": "itick", "fetched_at": "2026-09-04 11:40:00",
+      "itick_code": "XAUUSD", "itick_high": 4487.545, "itick_low": 4467.125,
+      "itick_open": 4476.075, "itick_volume": 478567.1, "itick_ts": 1788492381002,
+      "staleSec": 60
+    }
+  }
+}
+```
+
+### `quote.itick` 子对象（挂在 `/api/quotes` 每个品种下）
+| 字段 | 说明 |
+|------|------|
+| `price` / `code` | iTick 报价与品种代码 |
+| `divPct` | 相对主源的涨跌分歧（%）。`null` 表示无法比对 |
+| `preferred` | `true` = 该品种以 iTick 现货口径为准（已覆盖主源，见 `PREFER`） |
+| `filled` | `true` = 主源全挂，由 iTick 补位 |
+| `altPrice` / `altSource` | 仅 `preferred=true` 时存在：被覆盖的主源价及其来源（保留可比对） |
+| `staleSec` | 快照年龄（秒） |
+
+> `preferred` 仅对 `PREFER` 集合（现货黄金/现货白银）生效，且要求 `staleSec <= PREFER_MAX_STALE(300)`；
+> 快照过期自动回落主源，不会因 iTick 限流导致行情中断。
+
 ## 前端约定（generate_report.py）
 - `seriesMap` 标准格式：`{name:[[date, val], ...]}`（进阶/行情图通用）。
 - `neonLine(cid, seriesMap, opt)`：`opt={colors:[...], yName, suffix, areaTop, height, glowColor, markLast}`。

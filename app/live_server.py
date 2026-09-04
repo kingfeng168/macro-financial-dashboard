@@ -1090,6 +1090,7 @@ def get_quotes(force=False):
         "sources": agg.get("sources", {}),
         "health": agg.get("health", {}),
         "fetched_at": agg.get("fetched_at", ""),
+        "itick": agg.get("itick"),
     }
 
     # --- Fallback to daily_data.json last-known prices for symbols still missing ---
@@ -1119,6 +1120,7 @@ def get_quotes_with_meta(force=False):
         "sources": _qmeta.get("sources", {}),
         "health": _qmeta.get("health", {}),
         "fetched_at": _qmeta.get("fetched_at", ""),
+        "itick": _qmeta.get("itick"),
         "count": len(_qcache or {}),
     }
 
@@ -1225,6 +1227,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json(get_macro_realtime(force=("refresh" in params)))
         elif path == "/api/advanced":
             self._json(get_advanced_realtime(force=("refresh" in params)))
+        elif path == "/api/itick":
+            # iTick \u6570\u636e\u6e90\u5b9e\u65f6\u72b6\u6001 + \u5feb\u7167\u62a5\u4ef7\uff08\u8bfb\u5185\u5b58\uff0c\u96f6 API \u8c03\u7528\uff09
+            try:
+                import itick_data
+                self._json({"status": "ok", "state": itick_data.status(),
+                            "quotes": itick_data.get_snapshot()})
+            except Exception as e:
+                self._json({"status": "error", "error": str(e)})
         elif path == "/api/status":
             d = _load_json_data()
             self._json({"status": "ok", "time": time.time(),
@@ -1235,6 +1245,7 @@ class Handler(BaseHTTPRequestHandler):
                         "data_file": os.path.join(os.environ.get("WORKBUDDY_DATA_DIR", DIR), "daily_data.json"),
                         "sources": _qmeta.get("sources", {}),
                         "health": _qmeta.get("health", {}),
+                        "itick": _qmeta.get("itick"),
                         "quotes_fetched_at": _qmeta.get("fetched_at", "")})
         else:
             self._static(path)
@@ -1319,12 +1330,39 @@ class TS(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
+def _start_itick():
+    """\u542f\u52a8 iTick \u540e\u53f0\u8f6e\u8be2\uff08\u514d\u8d39\u5957\u9910\u9650\u6d41 5 \u6b21/\u5206\u949f\uff0c\u7edd\u5bf9\u4e0d\u80fd\u8fdb\u8bf7\u6c42\u94fe\u8def\uff09\u3002
+
+    \u542f\u52a8\u65f6\u5148\u540c\u6b65\u9884\u70ed 1 \u5206\u949f\u989d\u5ea6\uff08\u9ed8\u8ba4 5 \u6b21\uff09\u4fdd\u8bc1\u9996\u5c4f\u6709\u6570\u636e\uff0c
+    \u518d\u4ea4\u7ed9\u5b88\u62a4\u7ebf\u7a0b\u6309\u4ee4\u724c\u6876\u8282\u594f\u8f6e\u8f6c\u5237\u65b0\u5168\u90e8\u54c1\u79cd\u3002
+    """
+    try:
+        import itick_data
+    except Exception as e:
+        print(f"  iTick:      \u6a21\u5757\u672a\u52a0\u8f7d ({e})")
+        return None
+    if not getattr(itick_data, "ITICK_TOKEN", ""):
+        print("  iTick:      \u672a\u914d\u7f6e Token\uff08\u8bbe\u7f6e ITICK_TOKEN \u73af\u5883\u53d8\u91cf\u542f\u7528\uff09")
+        return None
+    try:
+        got = itick_data.bootstrap()
+    except Exception as e:
+        got = 0
+        print(f"  iTick:      \u9884\u70ed\u5931\u8d25 {e}")
+    itick_data.start_background()
+    st = itick_data.status()
+    print(f"  iTick:      {got} \u4e2a\u54c1\u79cd\u5df2\u9884\u70ed | \u540e\u53f0\u8f6e\u8be2\u5df2\u542f\u52a8 "
+          f"({st['rpm']} \u6b21/\u5206\u949f, \u5171 {st['symbols']} \u54c1\u79cd, base={st['base']})")
+    return st
+
+
 if __name__ == "__main__":
     sv = TS(("0.0.0.0", PORT), Handler)
     print(f"\033[92m\u25b6 Live Server running at http://localhost:{PORT}\033[0m")
     print(f"  Dashboard:  http://localhost:{PORT}")
-    print(f"  API:        /api/quotes  /api/news  /api/kline?name=XXX&tf=1h|4h|1d  /api/calendar  /api/macro")
+    print(f"  API:        /api/quotes  /api/news  /api/kline?name=XXX&tf=1h|4h|1d  /api/calendar  /api/macro  /api/itick")
     print(f"  Forex (ER): {len(FOREX_ER)} pairs  |  Sina: {len(SINA)} |  Yahoo: {len(YAHOO)}")
+    _start_itick()
     print("  Ctrl+C to stop")
     try:
         sv.serve_forever()
