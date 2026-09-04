@@ -85,10 +85,100 @@ def _apply_spot_caliber(D):
         notes.append(f"{name} 月度/日线序列+收盘价已按现货口径重算（{bun['code']}，"
                      f"{bun['last_date']} 收 {bun['last']:.2f}）" +
                      ("" if hist_ok else "，日线主图未替换"))
+        _sync_named(_sync_named_targets(D), name, bun["last"], bun["chg_pct"],
+                    f"现货 {bun['code']} 收盘{bun['chg_pct']:+.2f}%（{bun['last_date']}）")
+        # 综合走势图里的贵金属：原值是占位整数（5500/5000/4200...），与真实行情差 3% 以上
+        _replace_combined(D, name, bun["months"], bun["last"], notes)
     D["chart_commodities"] = charts
     D["commodity_data"] = rows
+
+    # 综合走势图的 WTI：原末值 84.94 与真实期货 91.8 差 7%，用主图同源日线重算
+    _replace_combined_from_hist(D, "WTI\u539f\u6cb9", notes)
     D["caliber_note"] = "；".join(notes)
     return D
+
+
+def _sync_named_targets(D):
+    """需要按品种名同步收盘价的列表：总览表 + 首页统计卡。"""
+    return [D.get("overview_items") or [], D.get("stat_cards") or []]
+
+
+def _sync_named(targets, name, price, chg_pct, note):
+    """把指定品种的收盘价/涨跌/备注同步到总览表与首页统计卡。
+
+    这两处在运行时会被实时行情覆盖，但**导出 Excel 用的是静态值**——
+    静态快照若仍是期货价或占位值，导出的报表就是错的。
+    """
+    for lst in targets:
+        for row in lst:
+            if not (isinstance(row, list) and row):
+                continue
+            if row[0] == name:                      # stat_cards: [名称, 值, 色, 涨跌]
+                row[1] = f"{price:,.2f}"
+                row[2] = "#ff4d4f" if chg_pct > 0 else ("#3fb950" if chg_pct < 0 else "#7ee787")
+                row[3] = f"{chg_pct:+.2f}%"
+            elif len(row) >= 4 and row[1] == name:  # overview_items: [类别, 名称, 价, 涨跌, 备注]
+                row[2] = round(price, 4)
+                row[3] = chg_pct
+                if len(row) >= 5:
+                    row[4] = note
+
+
+def _replace_combined(D, name, months, last_close, notes):
+    """综合走势图（chart_combined）里指定品种改用真实月度收盘。
+
+    该函数原始数据前 6 点是手工占位整数（黄金 5500/5000/4200/3398/3800/3990），
+    末值 4333 与真实行情 4469 差 3%，且首页统计卡直接取用这个末值。
+    """
+    cb = D.get("chart_combined") or {}
+    old = cb.get(name)
+    if not isinstance(old, list) or not old:
+        return False
+    n = len(old)
+    src = months[-n:] if len(months) >= n else None
+    if not src:
+        return False
+    cb[name] = [round(v, 4) for v in src]
+    D["chart_combined"] = cb
+    D.setdefault("_combined_real", [])
+    if name not in D["_combined_real"]:
+        D["_combined_real"].append(name)
+    notes.append(f"综合走势图 {name} 已由占位值替换为真实月度收盘"
+                 f"（原末值 {old[-1]} → {src[-1]:.2f}）")
+    return True
+
+
+def _replace_combined_from_hist(D, name, notes):
+    """综合走势图里没有 iTick 覆盖的品种，用主图同源日线（hist_*）重算。"""
+    cb = D.get("chart_combined") or {}
+    old = cb.get(name)
+    hist = D.get("hist_commodities") or {}
+    dates, series = hist.get("dates") or [], (hist.get("series") or {})
+    vals = series.get(name)
+    if not isinstance(old, list) or not old or not dates or not vals:
+        return False
+    bym = {}
+    for i, d in enumerate(dates):
+        if i < len(vals) and vals[i] is not None:
+            bym[(d or "")[:7]] = float(vals[i])
+    src = [bym[k] for k in sorted(bym.keys())]
+    n = len(old)
+    if len(src) < n:
+        return False
+    src = src[-n:]
+    cb[name] = [round(v, 4) for v in src]
+    D["chart_combined"] = cb
+    D.setdefault("_combined_real", [])
+    if name not in D["_combined_real"]:
+        D["_combined_real"].append(name)
+    notes.append(f"综合走势图 {name} 已由占位值替换为真实月度收盘"
+                 f"（原末值 {old[-1]} → {src[-1]:.2f}）")
+    # 首页统计卡同理：原值取自综合走势图末点，占位数据导致显示 84.94（真实 91.8，差 7%）
+    tail = [v for v in vals if v is not None][-2:]
+    if len(tail) == 2 and tail[0]:
+        _sync_named([D.get("stat_cards") or []], name, tail[1],
+                    round((tail[1] / tail[0] - 1) * 100, 2), "")
+    return True
 
 
 try:
@@ -593,6 +683,18 @@ H.append('<div class="st">金融产品走势分析</div>')
 for cat,ttl,body,focus in D["analysis_data"]:
     H.append(f'<div class="ac"><div class="ct">{cat}</div><div class="tt">{ttl}</div><div class="bd">{body}</div><div class="fo">&#9888; {focus}</div></div>')
 H.append(cb("analysis"))
+# 综合走势图数据可信度标注：只有部分品种有免费真实月度源，其余仍是人工估算的
+# 整数占位值——不写清楚，读者会把它当真实行情用。
+# 注意：必须放在 H.append(JS) 之前，否则会被塞进 <script> 块里导致 JS 语法错误。
+_part_real = sorted(set(D.get("_combined_real") or []))
+_part_est = [k for k in (D.get("chart_combined") or {}) if k not in _part_real]
+if _part_est:
+    H.append(
+        '<div class="co-note" style="border-left-color:#8b949e;color:#8b949e;display:block;'
+        'margin-top:10px">&#9888; 综合走势图数据可信度：'
+        + ('、'.join(_part_real) + ' 为真实月度收盘；' if _part_real else '')
+        + '、'.join(sorted(_part_est))
+        + ' 暂无免费历史接口，当前为人工估算的趋势示意值，<b>不可用于交易决策</b>。</div>')
 H.append('</div>')
 
 # Macro
