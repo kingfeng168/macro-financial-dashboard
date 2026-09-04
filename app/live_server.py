@@ -1197,17 +1197,21 @@ def get_kline(name, tf="1d", force=False):
                 kl = ag
 
     # 2.5 iTick K 线（真实 OHLC，非阻塞：缺额度则静默跳过继续走原链路）
-    #  - PREFER 品种（现货黄金/白银）：优先用 iTick，保证与展示的现货价口径一致
-    #  - 其余品种：仅当 Yahoo/Sina 都没拿到时才兜底，避免无谓消耗 5 次/分钟额度
+    #
+    # **只对 PREFER 品种（现货黄金/白银）使用**。
+    # 曾经对全部品种开放"前面都失败就兜底"，结果在原油上重演了口径打架：
+    #   报价 WTI 91.65（新浪期货）vs K 线末根 92.23（iTick USOIL 现货）
+    #   报价布伦特 95.64（期货）  vs K 线末根 97.74（iTick UKOIL 现货）
+    # 非 PREFER 品种保持期货口径，应继续走「内存历史（由期货价累积）→ daily_data」，
+    # 这两者都与期货报价一致；插入 iTick 现货反而制造不一致。
+    # 顺带也更省额度（免费套餐仅 5 次/分钟）。
     try:
         import itick_data
-        if getattr(itick_data, "ITICK_TOKEN", ""):
-            _prefer_kl = name in getattr(itick_data, "PREFER", ())
-            if _prefer_kl or not kl:
-                _raw = itick_data.fetch_kline(name, tf, 200)
-                if _raw:
-                    kl = [{"time": x["t"], "open": x["o"], "high": x["h"],
-                           "low": x["l"], "close": x["c"]} for x in _raw][-200:]
+        if getattr(itick_data, "ITICK_TOKEN", "") and name in getattr(itick_data, "PREFER", ()):
+            _raw = itick_data.fetch_kline(name, tf, 200)
+            if _raw:
+                kl = [{"time": x["t"], "open": x["o"], "high": x["h"],
+                       "low": x["l"], "close": x["c"]} for x in _raw][-200:]
     except Exception:
         pass
 
